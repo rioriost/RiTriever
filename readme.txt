@@ -2,7 +2,7 @@
 Contributors: rioriost
 Tags: search, semantic search, vector search, embeddings, rag
 Requires at least: 6.6
-Tested up to: 7.0
+Tested up to: 7.1
 Requires PHP: 8.1
 Stable tag: 0.2.3
 License: GPLv2 or later

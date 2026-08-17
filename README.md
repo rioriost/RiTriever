@@ -23,7 +23,7 @@ RiTriever は、WordPress の検索に RAG 風のベクトル検索を追加す�
 ### WordPress / PHP
 
 - WordPress 6.6 以上
-- Tested up to WordPress 7.0
+- Tested up to WordPress 7.1
 - PHP 8.1 以上
 
 ### データベース
@@ -277,6 +277,18 @@ GPL v2 or later
 詳細は `LICENSE` を参照してください。
 
 ## 開発者向け
+
+### WordPress バージョン互換性
+
+Docker Desktop 上の一時的なローカル検証環境で、配布対象と同じ内容の ZIP をインストールしてテストします。Docker Compose は開発・検証用であり、本番デプロイ手段ではありません。
+
+- WordPress 7.0.4 + MariaDB: `make wordpress-compat-stable`
+- WordPress 7.1-RC3 + MariaDB + Plugin Check: `make wordpress-compat-rc`
+- 上記 MariaDB matrix: `make wordpress-compat-matrix`
+- WordPress 7.1-RC3 + MySQL fallback: `make wordpress-compat-mysql`
+- 任意の組み合わせ: `make wordpress-compat WP_VERSION=7.1-RC3 WP_COMPAT_DB=mariadb`
+
+各テストは専用の Compose project、volume、port を使い、終了時に削除します。WordPress のバージョンは WP-CLI `core download --version=...` で固定されます。Apple Container の手動環境でも `RITRIEVER_WORDPRESS_VERSION=7.1-RC3 make apple-container-reset apple-container-up` のようにバージョンを固定できます。
 
 配布用 ZIP は次で作成します。
 

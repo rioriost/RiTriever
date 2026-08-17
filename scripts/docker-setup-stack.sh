@@ -13,6 +13,8 @@ DIMENSIONS="${RITRIEVER_EMBEDDING_DIMENSIONS:-16}"
 ADMIN_USER="${RITRIEVER_ADMIN_USER:-admin}"
 ADMIN_PASSWORD="${RITRIEVER_ADMIN_PASSWORD:-password}"
 ADMIN_EMAIL="${RITRIEVER_ADMIN_EMAIL:-admin@example.test}"
+WORDPRESS_VERSION="${RITRIEVER_WORDPRESS_VERSION:-}"
+PLUGIN_ZIP="${RITRIEVER_PLUGIN_ZIP:-}"
 
 if [ "$STACK" = "mariadb" ]; then
   WP_SERVICE="wp-mariadb"
@@ -40,6 +42,10 @@ run_wp() {
   $COMPOSE run --rm "$WPCLI_SERVICE" --path=/var/www/html "$@"
 }
 
+run_wp_root() {
+  $COMPOSE run --rm --user 0 "$WPCLI_SERVICE" --allow-root --path=/var/www/html "$@"
+}
+
 $COMPOSE up -d embedding-mock "$DB_SERVICE" "$WP_SERVICE"
 
 echo "Waiting for WordPress files in ${WP_SERVICE}..."
@@ -53,6 +59,20 @@ until run_wp core version >/dev/null 2>&1; do
   sleep 2
 done
 
+if [ "$WORDPRESS_VERSION" != "" ]; then
+  run_wp_root core download --version="$WORDPRESS_VERSION" --force --skip-content >/dev/null
+  $COMPOSE run --rm --user 0 "$WPCLI_SERVICE" sh -c \
+    "chown -R 33:33 /var/www/html/wp-admin /var/www/html/wp-includes &&
+     chown 33:33 /var/www/html /var/www/html/wp-content /var/www/html/wp-content/plugins &&
+     mkdir -p /var/www/html/wp-content/upgrade /var/www/html/wp-content/uploads &&
+     chown -R 33:33 /var/www/html/wp-content/upgrade /var/www/html/wp-content/uploads"
+  ACTUAL_WORDPRESS_VERSION=$(run_wp core version)
+  if [ "$ACTUAL_WORDPRESS_VERSION" != "$WORDPRESS_VERSION" ]; then
+    echo "Expected WordPress ${WORDPRESS_VERSION}, got ${ACTUAL_WORDPRESS_VERSION}." >&2
+    exit 1
+  fi
+fi
+
 if ! run_wp core is-installed >/dev/null 2>&1; then
   run_wp core install \
     --url="$URL" \
@@ -61,6 +81,13 @@ if ! run_wp core is-installed >/dev/null 2>&1; then
     --admin_password="$ADMIN_PASSWORD" \
     --admin_email="$ADMIN_EMAIL" \
     --skip-email
+elif [ "$WORDPRESS_VERSION" != "" ]; then
+  run_wp core update-db >/dev/null
+fi
+
+if [ "$PLUGIN_ZIP" != "" ]; then
+  $COMPOSE cp "$PLUGIN_ZIP" "${WP_SERVICE}:/var/www/html/wp-content/ritriever-compat.zip"
+  run_wp_root plugin install /var/www/html/wp-content/ritriever-compat.zip --force >/dev/null
 fi
 
 # Write settings before activation so the activation-created vector table uses

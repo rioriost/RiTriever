@@ -25,7 +25,10 @@ else
 fi
 
 URL="http://${HOST}:${PORT}"
-SEARCH_FILE="/tmp/ritriever-${STACK}-search.html"
+OUTPUT_DIR="${RITRIEVER_TEST_OUTPUT_DIR:-output}"
+SEARCH_FILE="${OUTPUT_DIR}/ritriever-${STACK}-search.html"
+mkdir -p "$OUTPUT_DIR"
+trap 'rm -f "$SEARCH_FILE"' EXIT INT TERM
 
 run_wp() {
   $COMPOSE run --rm "$WPCLI_SERVICE" --path=/var/www/html "$@"
@@ -50,13 +53,13 @@ if [ "$HTTP_CODE" != "200" ]; then
 fi
 
 if [ "$STACK" = "mariadb" ]; then
-  TABLE_EXISTS=$(run_sql "SHOW TABLES LIKE 'ritriever_chunks';" | wc -l | tr -d ' ')
+  TABLE_EXISTS=$(run_sql "SHOW TABLES LIKE 'wp_ritriever_chunks';" | wc -l | tr -d ' ')
   if [ "$TABLE_EXISTS" = "0" ]; then
     echo "Expected ritriever_chunks table on MariaDB stack." >&2
     exit 1
   fi
 
-  CHUNKS=$(run_sql "SELECT COUNT(*) FROM ritriever_chunks;")
+  CHUNKS=$(run_sql "SELECT COUNT(*) FROM wp_ritriever_chunks;")
   if [ "$CHUNKS" -le 0 ]; then
     echo "Expected indexed vector chunks on MariaDB stack." >&2
     exit 1
@@ -72,14 +75,14 @@ if [ "$STACK" = "mariadb" ]; then
     echo "Expected at least one [RAG] badge in MariaDB search output." >&2
     exit 1
   fi
-  if ! grep -q '\[標準検索\]' "$SEARCH_FILE"; then
-    echo "Expected at least one [標準検索] badge in MariaDB search output." >&2
+  if ! grep -Eq '\[(Standard search|標準検索)\]' "$SEARCH_FILE"; then
+    echo "Expected at least one standard-search badge in MariaDB search output." >&2
     exit 1
   fi
 
   echo "MariaDB smoke test passed: ${CHUNKS} vector chunks, ${URL}/?s=vector returned RAG and standard badges."
 else
-  TABLE_EXISTS=$(run_sql "SHOW TABLES LIKE 'ritriever_chunks';" | wc -l | tr -d ' ')
+  TABLE_EXISTS=$(run_sql "SHOW TABLES LIKE 'wp_ritriever_chunks';" | wc -l | tr -d ' ')
   if [ "$TABLE_EXISTS" != "0" ]; then
     echo "Expected no ritriever_chunks table on default MySQL stack." >&2
     exit 1

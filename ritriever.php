@@ -4,7 +4,7 @@
  * Description:       Native-vector RAG search for WordPress using MariaDB 11.7+ or compatible MySQL 9.x vector indexes. Embeds posts on publish/update and blends vector retrieval with standard WordPress search.
  * Version:           0.2.3
  * Requires at least: 6.6
- * Tested up to:      7.0
+ * Tested up to:      7.1
  * Requires PHP:      8.1
  * Author:            Rio Fujita
  * Author URI:        https://rio.st/

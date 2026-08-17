@@ -23,6 +23,7 @@ WP_DB_ROOT_PASSWORD="${WP_DB_ROOT_PASSWORD:-root}"
 WP_ADMIN_USER="${WP_ADMIN_USER:-admin}"
 WP_ADMIN_PASSWORD="${WP_ADMIN_PASSWORD:-password}"
 WP_ADMIN_EMAIL="${WP_ADMIN_EMAIL:-admin@example.test}"
+WORDPRESS_VERSION="${RITRIEVER_WORDPRESS_VERSION:-}"
 
 need_container() {
   if ! command -v container >/dev/null 2>&1; then
@@ -51,6 +52,18 @@ start_existing() {
 
 run_wpcli() {
   container exec "$APPLE_CONTAINER_WP" wp --allow-root --path="$WP_PATH" "$@"
+}
+
+ensure_wordpress_version() {
+  if [ "$WORDPRESS_VERSION" = "" ]; then
+    return
+  fi
+  run_wpcli core download --version="$WORDPRESS_VERSION" --force --skip-content >/dev/null
+  actual_version="$(run_wpcli core version)"
+  if [ "$actual_version" != "$WORDPRESS_VERSION" ]; then
+    echo "Expected WordPress ${WORDPRESS_VERSION}, got ${actual_version}." >&2
+    exit 1
+  fi
 }
 
 ensure_wp_cli() {
@@ -164,6 +177,7 @@ up() {
   fi
   wait_for_wordpress_files
   ensure_wp_cli
+  ensure_wordpress_version
   if container exec "$APPLE_CONTAINER_WP" test -f "${WP_PATH}/wp-config.php" >/dev/null 2>&1; then
     set_db_host_config
   fi
@@ -176,6 +190,8 @@ up() {
       --admin_password="$WP_ADMIN_PASSWORD" \
       --admin_email="$WP_ADMIN_EMAIL" \
       --skip-email >/dev/null
+  elif [ "$WORDPRESS_VERSION" != "" ]; then
+    run_wpcli core update-db >/dev/null
   fi
 
   echo "Apple Container WordPress is ready at ${WP_URL}"
