@@ -2,7 +2,7 @@
 /**
  * Plugin Name:       RiTriever
  * Description:       Native-vector RAG search for WordPress using MariaDB 11.7+ or compatible MySQL 9.x vector indexes. Embeds posts on publish/update and blends vector retrieval with standard WordPress search.
- * Version:           0.2.3
+ * Version:           0.2.4
  * Requires at least: 6.6
  * Tested up to:      7.1
  * Requires PHP:      8.1
@@ -33,7 +33,7 @@ if (version_compare(PHP_VERSION, "8.1.0", "<")) {
     return;
 }
 
-const RITRIEVER_VERSION = "0.2.3";
+const RITRIEVER_VERSION = "0.2.4";
 const RITRIEVER_PLUGIN_FILE = __FILE__;
 const RITRIEVER_OPTION_KEY = "ritriever_settings";
 const RITRIEVER_POSTMETA_CONTENT_HASH = "_ritriever_content_hash";

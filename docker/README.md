@@ -41,12 +41,12 @@ The MariaDB smoke test requires indexed chunks and both `[RAG]` / `[標準検索
 
 The reproducible compatibility targets install a temporary release-equivalent ZIP into isolated local Docker Compose projects:
 
-1. `make wordpress-compat-stable` — WordPress 7.0.4 + MariaDB.
-2. `make wordpress-compat-rc` — WordPress 7.1-RC3 + MariaDB + Plugin Check.
-3. `make wordpress-compat-matrix` — both MariaDB versions.
-4. `make wordpress-compat-mysql` — WordPress 7.1-RC3 + MySQL fallback.
+1. `make wordpress-compat-baseline` — WordPress 7.0.4 + MariaDB.
+2. `make wordpress-compat-stable` — WordPress 7.1 + MariaDB + Plugin Check.
+3. `make wordpress-compat-matrix` — baseline and stable MariaDB versions.
+4. `make wordpress-compat-mysql` — WordPress 7.1 + MySQL fallback.
 
-Override versions with `WP_STABLE_VERSION`, `WP_RC_VERSION`, or use `make wordpress-compat WP_VERSION=<version> WP_COMPAT_DB=mariadb|mysql`. These Compose stacks are local test helpers, not a production deployment path.
+Override versions with `WP_BASELINE_VERSION`, `WP_STABLE_VERSION`, or use `make wordpress-compat WP_VERSION=<version> WP_COMPAT_DB=mariadb|mysql`. These Compose stacks are local test helpers, not a production deployment path.
 
 ## Import WXR test data
 

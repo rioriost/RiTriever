@@ -14,21 +14,21 @@ WPO_SVN_USERNAME ?= rioriost
 WPO_SVN_DIR ?= .wordpress-org/svn
 WPO_ASSETS_DIR ?= wordpress.org
 SVN_TAG_DIR := $(WPO_SVN_DIR)/tags/$(PLUGIN_VERSION)
-WP_STABLE_VERSION ?= 7.0.4
-WP_RC_VERSION ?= 7.1-RC3
+WP_BASELINE_VERSION ?= 7.0.4
+WP_STABLE_VERSION ?= 7.1
 WP_COMPAT_DB ?= mariadb
 
-.PHONY: help version install-tools static-check check composer-validate lint phpcs-security composer-audit compose-config plugin-check wordpress-compat wordpress-compat-stable wordpress-compat-rc wordpress-compat-matrix wordpress-compat-mysql apple-container-up apple-container-down apple-container-reset i18n-pot i18n-pot-check release-audit review-audit package-audit wordpress-org-assets-audit wordpress-org-checkout wordpress-org-stage wordpress-org-release clean package release
+.PHONY: help version install-tools static-check check composer-validate lint phpcs-security composer-audit compose-config plugin-check wordpress-compat wordpress-compat-baseline wordpress-compat-stable wordpress-compat-matrix wordpress-compat-mysql apple-container-up apple-container-down apple-container-reset i18n-pot i18n-pot-check release-audit review-audit package-audit wordpress-org-assets-audit wordpress-org-checkout wordpress-org-stage wordpress-org-release clean package release
 
 help:
 	@echo "Targets:"
 	@echo "  make check                    Run WordPress.org release gate checks"
 	@echo "  make release                  Run release gates and build $(ZIP_FILE)"
-	@echo "  make wordpress-compat-stable  Test WordPress $(WP_STABLE_VERSION) on MariaDB"
-	@echo "  make wordpress-compat-rc      Test WordPress $(WP_RC_VERSION) on MariaDB and run Plugin Check"
-	@echo "  make wordpress-compat-matrix  Run the stable and RC MariaDB compatibility tests"
-	@echo "  make wordpress-compat-mysql   Test WordPress $(WP_RC_VERSION) with the MySQL fallback"
-	@echo "  make wordpress-compat WP_VERSION=7.1-RC3 WP_COMPAT_DB=mariadb"
+	@echo "  make wordpress-compat-baseline Test WordPress $(WP_BASELINE_VERSION) on MariaDB"
+	@echo "  make wordpress-compat-stable   Test WordPress $(WP_STABLE_VERSION) on MariaDB and run Plugin Check"
+	@echo "  make wordpress-compat-matrix   Run baseline and stable MariaDB compatibility tests"
+	@echo "  make wordpress-compat-mysql    Test WordPress $(WP_STABLE_VERSION) with the MySQL fallback"
+	@echo "  make wordpress-compat WP_VERSION=7.1 WP_COMPAT_DB=mariadb"
 	@echo "  make wordpress-org-stage    Stage trunk, tags/$(PLUGIN_VERSION), and assets in $(WPO_SVN_DIR)"
 	@echo "  make wordpress-org-release  Commit staged release to WordPress.org SVN"
 	@echo "  make apple-container-up    Start local WordPress with Apple container"
@@ -57,22 +57,22 @@ compose-config:
 	if command -v docker >/dev/null 2>&1; then docker compose config >/dev/null && docker compose --profile tools config >/dev/null; else echo "docker not found; skipping Compose config validation"; fi
 
 plugin-check:
-	APPLE_CONTAINER_AUTO_START=$${APPLE_CONTAINER_AUTO_START:-1} PLUGIN_ZIP="$(ZIP_FILE)" sh scripts/run-plugin-check.sh
+	RITRIEVER_WORDPRESS_VERSION="$(WP_STABLE_VERSION)" APPLE_CONTAINER_AUTO_START=$${APPLE_CONTAINER_AUTO_START:-1} PLUGIN_ZIP="$(ZIP_FILE)" sh scripts/run-plugin-check.sh
 
 wordpress-compat:
 	test -n "$(WP_VERSION)"
 	sh scripts/test-wordpress-compat.sh "$(WP_VERSION)" "$(WP_COMPAT_DB)"
 
+wordpress-compat-baseline:
+	sh scripts/test-wordpress-compat.sh "$(WP_BASELINE_VERSION)" mariadb
+
 wordpress-compat-stable:
-	sh scripts/test-wordpress-compat.sh "$(WP_STABLE_VERSION)" mariadb
+	RITRIEVER_RUN_PLUGIN_CHECK=1 sh scripts/test-wordpress-compat.sh "$(WP_STABLE_VERSION)" mariadb
 
-wordpress-compat-rc:
-	RITRIEVER_RUN_PLUGIN_CHECK=1 sh scripts/test-wordpress-compat.sh "$(WP_RC_VERSION)" mariadb
-
-wordpress-compat-matrix: wordpress-compat-stable wordpress-compat-rc
+wordpress-compat-matrix: wordpress-compat-baseline wordpress-compat-stable
 
 wordpress-compat-mysql:
-	sh scripts/test-wordpress-compat.sh "$(WP_RC_VERSION)" mysql
+	sh scripts/test-wordpress-compat.sh "$(WP_STABLE_VERSION)" mysql
 
 apple-container-up:
 	sh scripts/apple-container-wordpress.sh up

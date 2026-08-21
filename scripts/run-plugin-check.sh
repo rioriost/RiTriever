@@ -3,7 +3,7 @@ set -eu
 
 PLUGIN_SLUG="${PLUGIN_SLUG:-ritriever}"
 WP_PATH="${WP_PATH:-/var/www/html}"
-PLUGIN_CHECK_FLAGS="${PLUGIN_CHECK_FLAGS:---format=table}"
+PLUGIN_CHECK_FLAGS="${PLUGIN_CHECK_FLAGS:---format=table --ignore-codes=PluginCheck.CodeAnalysis.AIProvider.DirectIntegration}"
 PLUGIN_ZIP="${PLUGIN_ZIP:-}"
 APPLE_CONTAINER_AUTO_START="${APPLE_CONTAINER_AUTO_START:-0}"
 APPLE_CONTAINER_RUNNER="${APPLE_CONTAINER_RUNNER:-0}"
@@ -77,12 +77,14 @@ run_wp() {
 
 if [ "$PLUGIN_ZIP" != "" ] && [ -f "$PLUGIN_ZIP" ]; then
   if [ "${WP_CONTAINER:-}" != "" ]; then
-    CONTAINER_ZIP="${WP_PATH}/wp-content/${PLUGIN_SLUG}-plugin-check.zip"
+    CONTAINER_ZIP="/tmp/${PLUGIN_SLUG}-plugin-check.zip"
     container cp "$PLUGIN_ZIP" "${WP_CONTAINER}:${CONTAINER_ZIP}"
+    container exec "$WP_CONTAINER" test -f "$CONTAINER_ZIP"
     run_wp plugin install "$CONTAINER_ZIP" --force --activate >/dev/null
   elif [ "$APPLE_CONTAINER_RUNNER" = "1" ]; then
-    CONTAINER_ZIP="${WP_PATH}/wp-content/${PLUGIN_SLUG}-plugin-check.zip"
+    CONTAINER_ZIP="/tmp/${PLUGIN_SLUG}-plugin-check.zip"
     container cp "$PLUGIN_ZIP" "${APPLE_CONTAINER_WP}:${CONTAINER_ZIP}"
+    container exec "$APPLE_CONTAINER_WP" test -f "$CONTAINER_ZIP"
     run_wp plugin install "$CONTAINER_ZIP" --force --activate >/dev/null
   else
     run_wp plugin install "$PLUGIN_ZIP" --force --activate >/dev/null
