@@ -42,6 +42,15 @@ final class BackfillCommand
      */
     public function backfill(array $args, array $assoc_args): void
     {
+        try {
+            $this->execute_backfill($args, $assoc_args);
+        } catch (\RuntimeException $error) {
+            \WP_CLI::error($error->getMessage());
+        }
+    }
+
+    private function execute_backfill(array $args, array $assoc_args): void
+    {
         if (!empty($assoc_args["start"])) {
             $state = BackfillRunner::create_queue();
             self::log_state("queue created", $state);
@@ -63,8 +72,17 @@ final class BackfillCommand
             ? (int) $assoc_args["batch-size"]
             : BackfillRunner::DEFAULT_BATCH_SIZE;
         do {
+            $before = (int) $state["processed"];
             $state = BackfillRunner::process_batch($batch_size);
             self::log_state("batch processed", $state);
+            if (
+                !empty($assoc_args["all"]) &&
+                (int) $state["processed"] === $before &&
+                in_array((string) $state["status"], ["queued", "running"], true)
+            ) {
+                \WP_CLI::warning("No immediate progress: another worker owns the queue or retries are backing off. The WP-Cron watchdog will continue; use --status for the next attempt.");
+                break;
+            }
         } while (
             !empty($assoc_args["all"]) &&
             in_array((string) $state["status"], ["queued", "running"], true)
@@ -89,7 +107,11 @@ final class BackfillCommand
                 "/" .
                 (int) $state["total"] .
                 ", errors=" .
-                (int) $state["errors"],
+                (int) $state["errors"] .
+                ", attempts=" . (int) ($state["attempts"] ?? 0) .
+                ", next_attempt=" . (int) ($state["next_attempt"] ?? 0) .
+                ", next_scheduled=" . (int) ($state["next_scheduled"] ?? 0) .
+                ", reason=" . (string) ($state["stop_reason"] ?? ""),
         );
     }
 }

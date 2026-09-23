@@ -12,16 +12,18 @@ namespace RiTriever\Admin;
 use RiTriever\BackfillRunner;
 use RiTriever\Database\VectorCapabilities;
 use RiTriever\Embedding\EmbeddingProviderFactory;
+use RiTriever\Embedding\EmbeddingResponseValidator;
 use RiTriever\IndexDiagnostics;
 use RiTriever\LanguageOptions;
 use RiTriever\Logger;
-use RiTriever\PostSync;
 use RiTriever\Provider\LocalVectorProvider;
+use RiTriever\SearchInterceptor;
 use RiTriever\Settings;
 
 final class SettingsPage
 {
     public const PAGE_SLUG = "ritriever-settings";
+    public const LIVE_QUERY_REGISTRY_OPTION = SearchInterceptor::LIVE_CACHE_INDEX_OPTION;
 
     private function __construct() {}
 
@@ -129,6 +131,7 @@ final class SettingsPage
                         "idle" => self::text("init_auto_idle"),
                         "retrying" => self::text("init_auto_retrying"),
                         "confirmCancel" => self::text("init_cancel_confirm"),
+                        "remaining" => self::text("queue_remaining"),
                     ],
                 ]) .
                 ";",
@@ -149,6 +152,7 @@ final class SettingsPage
             wp_die(esc_html(self::text("forbidden")));
         }
         check_admin_referer("ritriever_initialize");
+        self::assert_not_globally_stopped();
 
         $cap = VectorCapabilities::detect();
         if (!$cap["native_vector"] || !$cap["vector_index"]) {
@@ -165,7 +169,7 @@ final class SettingsPage
             self::redirect_with_notice("init_queued", [
                 "total" => (string) (int) $state["total"],
             ]);
-        } catch (\Throwable $e) {
+        } catch (\RuntimeException $e) {
             Logger::error("admin", "initialization queue creation failed", [
                 "error" => $e->getMessage(),
             ]);
@@ -186,7 +190,7 @@ final class SettingsPage
         try {
             $state = BackfillRunner::process_batch(50);
             wp_send_json_success(self::queue_payload($state));
-        } catch (\Throwable $e) {
+        } catch (\RuntimeException $e) {
             Logger::error("admin", "AJAX initialization batch failed", [
                 "error" => $e->getMessage(),
             ]);
@@ -226,17 +230,39 @@ final class SettingsPage
         $total = max(0, (int) ($state["total"] ?? 0));
         $processed = min($total, max(0, (int) ($state["processed"] ?? 0)));
         $errors = max(0, (int) ($state["errors"] ?? 0));
+        $remaining_failures = isset($state["remaining_failures"])
+            ? (int) $state["remaining_failures"]
+            : (int) IndexDiagnostics::summary(1)["failed_count"];
         $status = (string) ($state["status"] ?? "idle");
+        $next_run = max(0, (int) ($state["next_run_at"] ?? $state["next_scheduled"] ?? $state["next_attempt"] ?? 0));
+        $message = (bool) Settings::get("kill_switch_global")
+            ? self::text("globally_stopped")
+            : self::queue_message($status);
+        if (!empty($state["stop_reason"]) || $next_run > 0 || !empty($state["attempts"])) {
+            $message .= " " . sprintf(
+                self::text("queue_details"),
+                max(0, (int) ($state["attempts"] ?? 0)),
+                $next_run > 0 ? wp_date("Y-m-d H:i:s", $next_run) : "—",
+                (string) ($state["stop_reason"] ?? "—"),
+            );
+        }
         return [
             "status" => $status,
             "phase" => (string) ($state["phase"] ?? ""),
             "total" => $total,
             "processed" => $processed,
             "errors" => $errors,
+            "remaining" => max(0, (int) ($state["remaining"] ?? ($total - $processed))),
+            "remaining_failures" => max(0, $remaining_failures),
+            "job_id" => (int) ($state["job_id"] ?? 0),
+            "generation" => (string) ($state["generation"] ?? ""),
+            "attempts" => max(0, (int) ($state["attempts"] ?? 0)),
+            "next_run_at" => $next_run,
+            "stop_reason" => (string) ($state["stop_reason"] ?? ""),
             "percent" =>
                 $total > 0 ? (int) floor(($processed / $total) * 100) : 0,
             "last_error" => (string) ($state["last_error"] ?? ""),
-            "message" => self::queue_message($status),
+            "message" => $message,
         ];
     }
 
@@ -245,7 +271,7 @@ final class SettingsPage
         if ($status === "complete") {
             return self::text("init_auto_complete");
         }
-        if ($status === "failed") {
+        if ($status === "failed" || $status === "completed_with_errors") {
             return self::text("init_auto_failed");
         }
         if ($status === "paused") {
@@ -266,30 +292,34 @@ final class SettingsPage
             wp_die(esc_html(self::text("forbidden")));
         }
         check_admin_referer("ritriever_test_embedding");
+        self::assert_not_globally_stopped();
 
         try {
             $started = microtime(true);
             $provider = EmbeddingProviderFactory::make();
             $embedding = $provider->embed(
-                "RiTriever embedding provider test",
+                LanguageOptions::with_embedding_context("RiTriever embedding provider test"),
+            );
+            EmbeddingResponseValidator::validate(
+                [$embedding],
+                1,
+                (int) Settings::get("embedding_dimensions"),
+                (string) Settings::get("vector_distance"),
             );
             $elapsed_ms = (int) round((microtime(true) - $started) * 1000);
-            if ($embedding === []) {
-                throw new \RuntimeException("Embedding response was empty.");
-            }
             self::redirect_with_notice("embedding_test_ok", [
                 "provider" => (string) Settings::get("embedding_provider"),
                 "model" => $provider->model(),
                 "dimensions" => (string) count($embedding),
                 "elapsed_ms" => (string) $elapsed_ms,
             ]);
-        } catch (\Throwable $e) {
+        } catch (\RuntimeException $e) {
             Logger::error("admin", "embedding provider test failed", [
                 "provider" => (string) Settings::get("embedding_provider"),
                 "error" => $e->getMessage(),
             ]);
             self::redirect_with_notice("embedding_test_failed", [
-                "error" => rawurlencode($e->getMessage()),
+                "error" => $e->getMessage(),
             ]);
         }
     }
@@ -310,15 +340,15 @@ final class SettingsPage
                     "index_used" => !empty($probe["index_used"]) ? "1" : "0",
                     "nearest" => (string) $probe["nearest"],
                     "distance" => (string) $probe["distance"],
-                    "message" => rawurlencode((string) $probe["message"]),
+                    "message" => (string) $probe["message"],
                 ],
             );
-        } catch (\Throwable $e) {
+        } catch (\RuntimeException $e) {
             Logger::error("admin", "DB capability test failed", [
                 "error" => $e->getMessage(),
             ]);
             self::redirect_with_notice("db_test_failed", [
-                "message" => rawurlencode($e->getMessage()),
+                "message" => $e->getMessage(),
             ]);
         }
     }
@@ -329,6 +359,7 @@ final class SettingsPage
             wp_die(esc_html(self::text("forbidden")));
         }
         check_admin_referer("ritriever_live_vector_query");
+        self::assert_not_globally_stopped();
 
         $query = isset($_POST["ritriever_live_query"])
             ? sanitize_text_field(
@@ -337,7 +368,7 @@ final class SettingsPage
             : "";
         if ($query === "") {
             self::redirect_with_notice("live_query_failed", [
-                "error" => rawurlencode(self::text("live_query_empty")),
+                "error" => self::text("live_query_empty"),
             ]);
         }
 
@@ -370,17 +401,17 @@ final class SettingsPage
             ];
         }
 
-        set_transient(
-            self::live_query_result_key(),
-            $payload,
-            10 * MINUTE_IN_SECONDS,
-        );
+        try {
+            self::store_live_query_result($payload);
+        } catch (\RuntimeException $e) {
+            self::redirect_with_notice("live_query_failed", ["error" => $e->getMessage()]);
+        }
         self::redirect_with_notice(
             $result->ok ? "live_query_ok" : "live_query_failed",
             [
                 "hits" => (string) count($payload["hits"]),
                 "elapsed_ms" => (string) $elapsed_ms,
-                "error" => rawurlencode((string) ($result->error ?? "")),
+                "error" => (string) ($result->error ?? ""),
             ],
         );
     }
@@ -391,34 +422,32 @@ final class SettingsPage
             wp_die(esc_html(self::text("forbidden")));
         }
         check_admin_referer("ritriever_retry_failed");
+        self::assert_not_globally_stopped();
 
         $post_id = isset($_POST["post_id"]) ? (int) $_POST["post_id"] : 0;
-        $ids =
-            $post_id > 0 ? [$post_id] : IndexDiagnostics::failed_post_ids(200);
-        $processed = 0;
-        $errors = 0;
-        foreach ($ids as $id) {
-            $id = (int) $id;
-            if ($id <= 0) {
-                continue;
-            }
-            PostSync::on_save_post($id, get_post($id));
-            $processed++;
-            if (
-                get_post_meta($id, RITRIEVER_POSTMETA_LAST_ERROR, true) !==
-                ""
-            ) {
-                $errors++;
-            }
+        try {
+            $result = BackfillRunner::retry_failed($post_id > 0 ? [$post_id] : []);
+            self::redirect_with_notice((int) $result["pending"] > 0 ? "retry_queued" : "retry_not_queued", [
+                "total" => (string) (int) $result["pending"],
+                "requested" => (string) (int) $result["requested"],
+                "skipped" => (string) (int) $result["skipped"],
+                "stop_reason" => (int) $result["pending"] === 0
+                    ? (string) ($result["state"]["stop_reason"] ?? "")
+                    : "",
+            ]);
+        } catch (\RuntimeException $e) {
+            Logger::error("admin", "Retry queue creation failed", [
+                "error" => $e->getMessage(),
+            ]);
+            self::redirect_with_notice("init_failed");
         }
+    }
 
-        self::redirect_with_notice(
-            $errors > 0 ? "retry_failed_done_with_errors" : "retry_failed_done",
-            [
-                "processed" => (string) $processed,
-                "errors" => (string) $errors,
-            ],
-        );
+    private static function assert_not_globally_stopped(): void
+    {
+        if ((bool) Settings::get("kill_switch_global")) {
+            self::redirect_with_notice("globally_stopped");
+        }
     }
 
     public static function render(): void
@@ -442,6 +471,10 @@ final class SettingsPage
 		<div class="wrap">
 			<h1>RiTriever</h1>
 			<?php self::render_notice(); ?>
+            <?php if ($opts["kill_switch_global"]): ?>
+                <div class="notice notice-warning"><p><?php echo esc_html(self::text("globally_stopped")); ?></p></div>
+            <?php endif; ?>
+            <p class="description"><?php echo esc_html(self::text("preset_migration_note")); ?></p>
 			<p><strong><?php echo esc_html(
        self::text("database"),
    ); ?>:</strong> <?php echo esc_html(
@@ -455,8 +488,14 @@ final class SettingsPage
 			<h2><?php echo esc_html("2. " . self::text("rag_search_settings")); ?></h2>
 			<form method="post" action="options.php">
 				<?php settings_fields("ritriever"); ?>
-				<?php self::hidden_state_fields($opts); ?>
 				<table class="form-table" role="presentation">
+                    <tr>
+                        <th scope="row"><?php echo esc_html(self::text("global_stop")); ?></th>
+                        <td>
+                            <input type="hidden" name="<?php echo esc_attr(RITRIEVER_OPTION_KEY); ?>[kill_switch_global]" value="0">
+                            <label><input type="checkbox" name="<?php echo esc_attr(RITRIEVER_OPTION_KEY); ?>[kill_switch_global]" value="1" <?php checked($opts["kill_switch_global"]); ?>> <?php echo esc_html(self::text("global_stop_note")); ?></label>
+                        </td>
+                    </tr>
 					<tr>
 						<th scope="row"><label for="ritriever-search-mode"><?php echo esc_html(
           self::text("rag_search_mode"),
@@ -895,33 +934,44 @@ final class SettingsPage
 
     private static function render_index_diagnostics(): void
     {
-        $summary = IndexDiagnostics::summary(); ?>
+        $summary = IndexDiagnostics::summary();
+        $available = (string) $summary["queue_status"] !== "unavailable";
+        $unknown = self::text("diagnostics_unknown");
+        if (!empty($summary["diagnostic_error"])) {
+            echo '<div class="notice notice-warning inline"><p>' .
+                esc_html((string) $summary["diagnostic_error"]) .
+                "</p></div>";
+        }
+        ?>
         <table class="widefat striped" style="max-width:760px;">
             <tbody>
+                <tr><th><?php echo esc_html(self::text("index_readiness")); ?></th><td><?php echo esc_html(
+                    self::text(!empty($summary["ready"]) ? "index_ready" : "index_not_ready"),
+                ); ?></td></tr>
                 <tr><th><?php echo esc_html(
                     self::text("eligible_posts"),
                 ); ?></th><td><?php echo esc_html(
-    (string) $summary["eligible_posts"],
+    $available ? (string) $summary["eligible_posts"] : $unknown,
 ); ?></td></tr>
                 <tr><th><?php echo esc_html(
                     self::text("indexed_posts"),
                 ); ?></th><td><?php echo esc_html(
-    (string) $summary["indexed_posts"],
+    $available ? (string) $summary["indexed_posts"] : $unknown,
 ); ?></td></tr>
                 <tr><th><?php echo esc_html(
                     self::text("coverage"),
                 ); ?></th><td><?php echo esc_html(
-    (string) $summary["coverage_percent"],
-); ?>%</td></tr>
+    $available ? (string) $summary["coverage_percent"] . "%" : $unknown,
+); ?></td></tr>
                 <tr><th><?php echo esc_html(
                     self::text("vector_chunks"),
                 ); ?></th><td><?php echo esc_html(
-    (string) $summary["chunk_count"],
+    $available ? (string) $summary["chunk_count"] : $unknown,
 ); ?></td></tr>
                 <tr><th><?php echo esc_html(
                     self::text("failed_posts"),
                 ); ?></th><td><?php echo esc_html(
-    (string) $summary["failed_count"],
+    $available ? (string) $summary["failed_count"] : $unknown,
 ); ?></td></tr>
                 <tr><th><?php echo esc_html(
                     self::text("queue_status"),
@@ -1007,7 +1057,7 @@ final class SettingsPage
                     <?php endforeach; ?>
                 </tbody>
             </table>
-        <?php else: ?>
+        <?php elseif ($available): ?>
             <p class="description"><?php echo esc_html(
                 self::text("no_failed_posts"),
             ); ?></p>
@@ -1067,6 +1117,14 @@ final class SettingsPage
         array $cap,
         bool $initialized,
     ): void {
+        $queue = BackfillRunner::status();
+        if (in_array((string) $queue["status"], ["queued", "running", "paused"], true)) {
+            self::render_queue_progress($queue);
+            return;
+        }
+        if (in_array((string) $queue["status"], ["failed", "completed_with_errors"], true)) {
+            self::render_queue_progress($queue);
+        }
         if ($initialized) {
             $completed_at = (int) $opts["initial_backfill_completed_at"];
             echo "<p>" .
@@ -1088,23 +1146,12 @@ final class SettingsPage
                 "</span></p>";
         }
 
-        $queue = BackfillRunner::status();
-        if (
-            in_array(
-                (string) $queue["status"],
-                ["queued", "running", "paused"],
-                true,
-            )
-        ) {
-            self::render_queue_progress($queue);
-            return;
-        }
         if ((string) $queue["status"] === "cancelled") {
             echo '<p class="notice notice-warning inline"><span>' .
                 esc_html(self::text("init_auto_cancelled")) .
                 "</span></p>";
         }
-        if ((string) $queue["status"] === "failed") {
+        if (in_array((string) $queue["status"], ["failed", "completed_with_errors"], true)) {
             echo '<p class="notice notice-error inline"><span>' .
                 esc_html(
                     sprintf(
@@ -1166,7 +1213,7 @@ final class SettingsPage
             esc_html((string) $percent) .
             "%</strong></p>";
         echo '<p class="description" data-ritriever-detail-text>' .
-            esc_html(self::queue_message((string) $queue["status"])) .
+            esc_html(self::queue_payload($queue)["message"]) .
             "</p>";
         echo '<p class="description">' .
             esc_html(self::text("init_background_note")) .
@@ -1185,25 +1232,6 @@ final class SettingsPage
         echo "</div>";
     }
 
-    private static function hidden_state_fields(array $opts): void
-    {
-        foreach (
-            [
-                "initial_backfill_completed_at",
-                "initial_backfill_processed",
-                "initial_backfill_errors",
-                "initial_backfill_reset_reason",
-            ]
-            as $key
-        ) {
-            echo '<input type="hidden" name="' .
-                esc_attr(RITRIEVER_OPTION_KEY . "[" . $key . "]") .
-                '" value="' .
-                esc_attr((string) ($opts[$key] ?? "")) .
-                '">';
-        }
-    }
-
     private static function render_notice(): void
     {
         // phpcs:disable WordPress.Security.NonceVerification.Recommended -- Read-only admin notice parameters from internal redirects.
@@ -1216,6 +1244,11 @@ final class SettingsPage
         $processed = isset($_GET["processed"]) ? (int) $_GET["processed"] : 0;
         $errors = isset($_GET["errors"]) ? (int) $_GET["errors"] : 0;
         $total = isset($_GET["total"]) ? (int) $_GET["total"] : 0;
+        $requested = isset($_GET["requested"]) ? (int) $_GET["requested"] : 0;
+        $skipped = isset($_GET["skipped"]) ? (int) $_GET["skipped"] : 0;
+        $stop_reason = isset($_GET["stop_reason"])
+            ? sanitize_text_field((string) wp_unslash($_GET["stop_reason"]))
+            : "";
         $hits = isset($_GET["hits"]) ? (int) $_GET["hits"] : 0;
         $dimensions = isset($_GET["dimensions"])
             ? (int) $_GET["dimensions"]
@@ -1256,6 +1289,7 @@ final class SettingsPage
                 "db_test_ok",
                 "live_query_ok",
                 "retry_failed_done",
+                "retry_queued",
             ],
             true,
         )
@@ -1268,6 +1302,11 @@ final class SettingsPage
             $message = sprintf($message, $processed, $errors);
         } elseif ($status === "init_queued") {
             $message = sprintf($message, $total);
+        } elseif ($status === "retry_queued" || $status === "retry_not_queued") {
+            $message = sprintf($message, $requested, $total, $skipped);
+            if ($status === "retry_not_queued" && $stop_reason !== "") {
+                $message .= " " . $stop_reason;
+            }
         } elseif ($status === "queue_processed") {
             $message = sprintf($message, $processed, $total);
         } elseif ($status === "embedding_test_ok") {
@@ -1314,6 +1353,19 @@ final class SettingsPage
         return "ritriever_live_query_" . get_current_user_id();
     }
 
+    private static function store_live_query_result(array $payload): void
+    {
+        if (
+            !SearchInterceptor::store_live_query_result(
+                self::live_query_result_key(),
+                $payload,
+                10 * MINUTE_IN_SECONDS,
+            )
+        ) {
+            throw new \RuntimeException("Could not store the live query result. Please retry.");
+        }
+    }
+
     private static function redirect_with_notice(
         string $status,
         array $args = [],
@@ -1334,7 +1386,10 @@ final class SettingsPage
 
     private static function text(string $key): string
     {
-        $ja = str_starts_with(strtolower((string) get_locale()), "ja");
+        $locale = function_exists("determine_locale")
+            ? determine_locale()
+            : (function_exists("get_user_locale") ? get_user_locale() : get_locale());
+        $ja = str_starts_with(strtolower((string) $locale), "ja");
         $copy = self::copy();
         $english = $copy["en"][$key] ?? $key;
         $translated = get_translations_for_domain("ritriever")->translate(
@@ -1351,6 +1406,14 @@ final class SettingsPage
     {
         return [
             "en" => [
+                "global_stop" => "Global stop",
+                "global_stop_note" => "Stop vector search, synchronization, queue work and embedding requests.",
+                "globally_stopped" => "RiTriever is globally stopped. WordPress standard search remains available. Disable Global stop before running embedding, initialization or retry operations; resume paused queues explicitly.",
+                "preset_migration_note" => "Presets now fill fields only when selected. If an earlier version overwrote your endpoint, deployment or model, re-enter those values and test the connection before rebuilding.",
+                "retry_queued" => 'Retry snapshot: %1$d posts; queued: %2$d; skipped: %3$d. Progress below tracks the current retry snapshot. Retries run in bounded batches, without a total retry cap.',
+                "retry_not_queued" => 'Retry snapshot: %1$d posts; queued: %2$d; skipped: %3$d. No work was queued. Check eligible posts, synchronization settings and index readiness.',
+                "queue_remaining" => 'Pending snapshot items: %1$d; current failed posts: %2$d.',
+                "queue_details" => 'Attempts: %1$d; next scheduled run: %2$s; stop reason: %3$s.',
                 "forbidden" => "Forbidden",
                 "database" => "Database",
                 "yes" => "yes",
@@ -1387,6 +1450,10 @@ final class SettingsPage
                 "score" => "Score",
                 "best_chunk_snippet" => "Best chunk snippet",
                 "index_diagnostics" => "Index diagnostics",
+                "index_readiness" => "Index readiness",
+                "index_ready" => "Ready",
+                "index_not_ready" => "Not ready — standard search remains active",
+                "diagnostics_unknown" => "Unknown",
                 "eligible_posts" => "Eligible posts",
                 "indexed_posts" => "Indexed posts",
                 "coverage" => "Coverage",
@@ -1444,7 +1511,7 @@ final class SettingsPage
                 "custom_embedding_format" => "Request format",
                 "custom_preset_manual" => "Manual custom HTTP settings",
                 "custom_embedding_preset_note" =>
-                    "Presets fill endpoint, model, and dimensions. Hosted fallback providers are limited to Azure OpenAI; these custom presets are for local or self-hosted services.",
+                    "Selecting a preset fills endpoint, model, format and dimensions once. You can then customize these fields; saving or reopening this page will not reset them.",
                 "custom_endpoint" => "Custom embedding endpoint",
                 "custom_api_key" => "Custom embedding API key",
                 "api_key_configured" => "API key is configured",
@@ -1479,17 +1546,17 @@ final class SettingsPage
                 "queue_processed" =>
                     'Processed initialization batch. Progress: %1$d / %2$d.',
                 "init_progress" =>
-                    'Initialization progress: %1$d / %2$d posts processed, %3$d errors.',
+                    'Indexing progress: %1$d / %2$d posts processed, %3$d terminal errors.',
                 "init_background_note" =>
-                    "Automatic indexing is running. You can leave this page open; if you close it, indexing will resume when you return and may also continue through WP-Cron where available.",
+                    "Queued work runs in bounded batches. WP-Cron needs site traffic or an external scheduler; paused or globally stopped work does not resume automatically.",
                 "init_auto_running" => "Automatic indexing is running...",
                 "init_auto_complete" =>
-                    "Initialization is complete. RAG search is ready.",
+                    "The indexing queue is complete. Search availability also depends on index readiness and your search settings.",
                 "init_auto_failed" =>
-                    "Initialization stopped with errors. Check the plugin log and retry failed posts.",
-                "init_auto_paused" => "Initialization is paused.",
-                "init_auto_cancelled" => "Initialization was cancelled.",
-                "init_auto_idle" => "Initialization is not currently running.",
+                    "Indexing stopped with errors. Check the plugin log and retry failed posts.",
+                "init_auto_paused" => "Indexing is paused.",
+                "init_auto_cancelled" => "Indexing was cancelled.",
+                "init_auto_idle" => "Indexing is not currently running.",
                 "init_auto_retrying" =>
                     "Temporary initialization error: %s. Retrying shortly...",
                 "init_pause" => "Pause",
@@ -1506,6 +1573,14 @@ final class SettingsPage
                     "Native vector support is unavailable for this database.",
             ],
             "ja" => [
+                "global_stop" => "全体停止",
+                "global_stop_note" => "ベクトル検索、同期、キュー処理、埋め込みリクエストを停止します。",
+                "globally_stopped" => "RiTriever は全体停止中です。WordPress 標準検索は利用できます。接続テスト、初期化、再試行の前に全体停止を解除し、一時停止したキューは明示的に再開してください。",
+                "preset_migration_note" => "プリセットは選択時のみ入力値を補完します。旧バージョンで接続先、deployment、モデルが上書きされた場合は再入力し、接続確認後に索引を再構築してください。",
+                "retry_queued" => '再試行対象: %1$d 件、キュー登録: %2$d 件、スキップ: %3$d 件。以下の進捗は今回の再試行スナップショットを示します。総件数の制限なく分割処理します。',
+                "retry_not_queued" => '再試行対象: %1$d 件、キュー登録: %2$d 件、スキップ: %3$d 件。処理は登録されませんでした。対象投稿、同期設定、索引の準備状態を確認してください。',
+                "queue_remaining" => 'スナップショット未処理: %1$d 件、現在の失敗投稿: %2$d 件。',
+                "queue_details" => '試行回数: %1$d、次回予定: %2$s、停止理由: %3$s。',
                 "forbidden" => "権限がありません",
                 "database" => "データベース",
                 "yes" => "はい",
@@ -1542,6 +1617,10 @@ final class SettingsPage
                 "score" => "スコア",
                 "best_chunk_snippet" => "最適チャンク抜粋",
                 "index_diagnostics" => "インデックス診断",
+                "index_readiness" => "索引の準備状態",
+                "index_ready" => "準備完了",
+                "index_not_ready" => "準備未完了 — 標準検索を継続",
+                "diagnostics_unknown" => "不明",
                 "eligible_posts" => "対象投稿数",
                 "indexed_posts" => "インデックス済み投稿数",
                 "coverage" => "カバー率",
@@ -1598,7 +1677,7 @@ final class SettingsPage
                 "custom_embedding_format" => "リクエスト形式",
                 "custom_preset_manual" => "手動設定",
                 "custom_embedding_preset_note" =>
-                    "候補を選び、必要ならエンドポイント、モデル、次元数を入力してください。Hosted fallback provider は Azure OpenAI に限定し、ここではローカルまたは self-hosted サービスを想定しています。",
+                    "プリセットを選ぶと接続先、モデル、形式、次元数を一度だけ補完します。その後の編集値は保存・再表示でも維持されます。",
                 "custom_endpoint" => "埋め込みエンドポイント",
                 "custom_api_key" => "埋め込み API キー",
                 "api_key_configured" => "API キー設定済み",
@@ -1633,17 +1712,17 @@ final class SettingsPage
                 "queue_processed" =>
                     '初期化バッチを処理しました。進捗: %1$d / %2$d。',
                 "init_progress" =>
-                    '初期化の進捗: %1$d / %2$d 件処理済み、エラー %3$d 件。',
+                    '索引処理の進捗: %1$d / %2$d 件処理済み、最終失敗 %3$d 件。',
                 "init_background_note" =>
-                    "自動インデックス処理を実行中です。この画面を開いたままにしてください。閉じた場合は再度この画面を開くと再開し、利用可能な環境では WP-Cron でも処理を継続します。",
+                    "キューを分割処理します。WP-Cron はサイトへのアクセスまたは外部スケジューラーが必要です。一時停止・全体停止中は自動再開しません。",
                 "init_auto_running" => "自動インデックス処理を実行中です...",
                 "init_auto_complete" =>
-                    "初期化が完了しました。RAG 検索を利用できます。",
+                    "索引キューが完了しました。検索の利用可否は索引の準備状態と検索設定にも依存します。",
                 "init_auto_failed" =>
-                    "初期化がエラーで停止しました。プラグインログを確認し、失敗した投稿を再試行してください。",
-                "init_auto_paused" => "初期化は一時停止中です。",
-                "init_auto_cancelled" => "初期化はキャンセルされました。",
-                "init_auto_idle" => "初期化は現在実行されていません。",
+                    "索引処理がエラーで停止しました。プラグインログを確認し、失敗した投稿を再試行してください。",
+                "init_auto_paused" => "索引処理は一時停止中です。",
+                "init_auto_cancelled" => "索引処理をキャンセルしました。",
+                "init_auto_idle" => "索引処理は現在実行されていません。",
                 "init_auto_retrying" =>
                     "一時的な初期化エラー: %s。まもなく再試行します...",
                 "init_pause" => "一時停止",

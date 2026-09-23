@@ -1,6 +1,6 @@
 <?php
 /**
- * Deterministic embedding mock for local Docker smoke tests.
+ * Deterministic embedding mock for local Apple Container smoke tests.
  *
  * Accepts POST JSON: {"input": "text"} or {"input": ["text", ...]}
  * Returns: {"embeddings": [[...]], "model": "ritriever-mock-N"}

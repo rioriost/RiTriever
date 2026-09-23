@@ -44,7 +44,7 @@ MariaDB 11.7 未満、MySQL 8.x はサポート対象外です。
 
 ### ZIP からインストール
 
-1. 配布 ZIP `ritriever-0.2.4.zip` を用意します。
+1. 配布 ZIP `ritriever-0.2.5.zip` を用意します。
 2. WordPress 管理画面で `プラグイン -> 新規追加 -> プラグインのアップロード` を開きます。
 3. ZIP をアップロードします。
 4. `RiTriever` を有効化します。
@@ -195,7 +195,13 @@ OpenAI などの外部 API を使う場合、少額の API 利用料が発生す
 
 初期化はバックグラウンドキューで処理されます。画面には進捗が表示されます。
 
+初期化後の投稿保存、対象カスタムフィールド・分類の変更も同じキューに集約します。保存リクエストの中で外部 embedding API の完了を待たないため、検索への反映はバックグラウンド処理後になります。
+
 埋め込みプロバイダー、モデル、次元数、インデックス対象の設定を変更した場合は、再度初期化してください。
+
+設定保存では既存のベクトルを削除せず、索引を未準備として扱います。入力方式・言語・対象投稿の条件が変わった後は、初期化が正常完了するまで標準検索を使います。初期化はベクトルを再作成し、外部プロバイダーを使う場合は対象件数に応じた API 料金が発生します。実行前にデータベースをバックアップしてください。
+
+公開済みの 0.2.4 以前から 0.2.5 に更新する場合、旧 content hash だけでは新しい索引への保存済みとは判定しないため、バックアップ後に初期化を1回実行してください。世代管理対応の開発ビルドですでに索引が準備完了の場合、今回のバージョン変更・検索フック修正だけを理由に再初期化する必要はありません。設定と索引を保持するため、削除・アンインストールせず既存プラグインを上書き更新してください。プリセットにより既に上書きされた endpoint は復元できないため、接続先の確認・再入力が必要です。
 
 ### 6. インデックス診断
 
@@ -233,6 +239,14 @@ OpenAI などの外部 API を使う場合、少額の API 利用料が発生す
 - `wp ritriever backfill --batch-size=20`
 - `wp ritriever backfill --all`
 
+バックグラウンド処理には WP-Cron の起動が必要です。アクセスの少ないサイトや `DISABLE_WP_CRON` を使うサイトでは、外部 scheduler から WordPress cron を定期実行してください。管理画面を開いたままにすることは、cron の代わりにはなりません。
+
+検索対象や API / DB の状態を正しく維持できない場合は、RiTriever による書き換え前の標準検索へ戻します。正常時の hybrid 検索は候補数に上限があり、すべての標準検索結果を返すものではありません。近傍チャンクが同じ投稿に集中すると、返る投稿数は `top_k` より少なくなることがあります。
+
+テーマやプラグインの通常の `pre_get_posts` による条件変更が終わってから、RiTriever が検索条件を取得します。Visualizer 等の検索結果を変更しないフックが登録されているだけでは RAG を無効にしません。取り込んだ対象・除外条件はベクトル候補にも適用します。未対応の SQL フィルターや RiTriever と同じ最終優先度の独自フックがある場合は、引き続き安全側の標準検索を使用します。
+
+記事中の表記だけがヒットし、同義語がヒットしない場合は、まず検索モードが `full`（または管理者用 A/B）、埋め込みプロバイダーが設定済み、索引が準備完了であることを確認してください。検索モード `off` や索引未初期化の状態では同義語をベクトル検索しません。本文が一致する検索の成功だけでは RAG の稼働確認になりません。
+
 ## アンインストール
 
 プラグインをアンインストールすると、次のデータを削除します。
@@ -246,6 +260,7 @@ OpenAI などの外部 API を使う場合、少額の API 利用料が発生す
   - `_ritriever_content_hash`
   - `_ritriever_indexed_at`
   - `_ritriever_last_error`
+  - `_ritriever_index_generation`
 - scheduled queue event
 - local vector table
 
@@ -278,9 +293,23 @@ GPL v2 or later
 
 ## 開発者向け
 
+### 回帰テスト
+
+`make test` は、PHP / Node.js で分離した回帰テストを実行します。WordPress、実 DB、外部 API キーは不要です。provider 応答、索引の状態遷移、検索条件、cache、管理画面の遅延応答、uninstall を対象とし、配布 gate にも含まれます。
+
+保存の整合性確認には、WordPress の posts / postmeta / taxonomy / options テーブルにも InnoDB が必要です。critical section では advisory lock と同じ mysqli 接続を固定し、接続断後に SQL が autocommit で再送されないようにしています。通常の WordPress DB API からのこの限定的な例外は `includes/Database/Sql.php` に集約し、呼出し側で SQL を prepare します。
+
+実 WordPress / MariaDB での試験には `tests/integration/` の synthetic fixture を使います。既存サイトでは実行しないでください。実行する専用 WP-CLI プロセスで `RITRIEVER_INTEGRATION_TEST=1` とし、`--require=.../tests/integration/embedding-fixture.php` を指定すると、`https://ritriever.invalid/embeddings` に対する通信を16次元の決定的 mock に置き換えます。`wp eval-file .../tests/integration/wordpress.php prepare`、初期化・全件処理を2回、`wp eval-file .../tests/integration/wordpress.php verify` の順で、再初期化後の保存実体と設定保存時の非破壊性を確認できます。
+
+Apple Container の専用 WordPress を用意した場合は、`RITRIEVER_TEST_CONTAINER=ritriever-test-<name> sh scripts/test-apple-regression.sh` で同じ試験を実行できます。このスクリプトは指定したテスト用 container にプラグインをコピーし、synthetic 投稿と索引を作成します。
+
+この統合試験は実 DB の trigger で INSERT 失敗を注入し、旧チャンク・成功メタの保持、backoff 後の回復、正常時の hybrid 書換え、障害時の標準検索ページングも確認します。multisite 用の `multisite.php` と MySQL fallback 用の `fallback.php` は、それぞれの専用テスト構成で `wp eval-file` から実行できます。
+
+修正の根拠、優先度、移行・ロールバック方針は [GPT-6 Astra レビュー・修正計画](https://github.com/rioriost/RiTriever/blob/main/docs/gpt-6-astra-review-plan-2026-09-18.md) を参照してください。ロールバック時は worker を止めて標準検索を維持し、コードだけでなく対応する DB・options・投稿メタを整合した組で復元してください。
+
 ### WordPress バージョン互換性
 
-Docker Desktop 上の一時的なローカル検証環境で、配布対象と同じ内容の ZIP をインストールしてテストします。Docker Compose は開発・検証用であり、本番デプロイ手段ではありません。
+Apple Container 上の一時的なローカル検証環境で、配布対象と同じ内容の ZIP をインストールしてテストします。テストは `container` CLI に統一し、Docker は実行しません。本番デプロイ手段ではありません。
 
 - WordPress 7.0.4 + MariaDB: `make wordpress-compat-baseline`
 - WordPress 7.1 + MariaDB + Plugin Check: `make wordpress-compat-stable`
@@ -288,7 +317,11 @@ Docker Desktop 上の一時的なローカル検証環境で、配布対象と�
 - WordPress 7.1 + MySQL fallback: `make wordpress-compat-mysql`
 - 任意の組み合わせ: `make wordpress-compat WP_VERSION=7.1 WP_COMPAT_DB=mariadb`
 
-各テストは専用の Compose project、volume、port を使い、終了時に削除します。WordPress のバージョンは WP-CLI `core download --version=...` で固定されます。Apple Container の手動環境でも `RITRIEVER_WORDPRESS_VERSION=7.1 make apple-container-reset apple-container-up` のようにバージョンを固定できます。
+各テストは毎回一意の container、network、volume を使い、終了時に自分が作成したリソースだけを削除します。WordPress のバージョンは WP-CLI `core download --version=...` で固定されます。matrix はポート競合を避けるため順次実行します。個別テストを並列実行する場合は `RITRIEVER_COMPAT_PORT` と `RITRIEVER_COMPAT_EMBEDDING_PORT` を分けてください。
+
+`make apple-container-check` で Apple Container の CLI・サービスと shell script の構文を確認します。未導入・停止中ならエラーにし、別 runtime にフォールバックしません。旧 `COMPOSE` / `COMPOSE_FILE` / `WPCLI_COMMAND` 設定は実行前に拒否します。旧 Docker スクリプト・Compose manifest は削除しました。
+
+`container-compose 1.1.0` は `config` / `run` / `exec` を提供しないため、このテストフローでは直接 `container run/exec/cp` を使います。移行後の手動環境・WXR import・vector probe は [containers/README.md](https://github.com/rioriost/RiTriever/blob/main/containers/README.md) を参照してください。
 
 配布用 ZIP は次で作成します。
 
@@ -300,7 +333,7 @@ Docker Desktop 上の一時的なローカル検証環境で、配布対象と�
 2. PHP syntax lint
 3. PHPCS security scan
 4. Composer audit
-5. Docker Compose config validation
+5. Apple Container runtime / shell script checks
 6. WordPress.org Plugin Check
 7. readme.txt / i18n POT / package content checks
 8. ZIP packaging
@@ -311,7 +344,7 @@ Plugin Check は release gate の一部として ZIP を WordPress にインス�
 2. `make plugin-check`
 3. `make apple-container-down`
 
-既定の WordPress URL は `http://127.0.0.1:8081`、管理者は `admin` / `password` です。環境変数で `APPLE_CONTAINER_WP_PORT`、`APPLE_CONTAINER_NETWORK`、`APPLE_CONTAINER_DB`、`APPLE_CONTAINER_WP_VOLUME`、`WP_PATH` などを変更できます。既存の WordPress / WP-CLI を使う場合は `WP_CONTAINER=<container-id-or-name>`、`WPCLI_COMMAND='...'`、`COMPOSE='docker compose'` のいずれかを指定してください。
+既定の WordPress URL は `http://127.0.0.1:8081`、管理者は `admin` / `password` です。環境変数で `APPLE_CONTAINER_WP_PORT`、`APPLE_CONTAINER_NETWORK`、`APPLE_CONTAINER_DB`、`APPLE_CONTAINER_WP_VOLUME`、`WP_PATH` などを変更できます。既存の Apple Container 内の WordPress には `WP_CONTAINER=<container-id-or-name>`、ローカルの `wp` CLI には `LOCAL_WP_PATH` を指定してください。任意の command string や Compose runner は受け付けません。
 
 WordPress.org への公開は SVN release system に staging してから commit します。公開ページ用の banner / icon は `wordpress.org/` から SVN の `assets/` に同期されます。
 
@@ -323,7 +356,7 @@ WordPress.org への公開は SVN release system に staging してから commit
 
 出力例:
 
-- `dist/ritriever-0.2.4.zip`
+- `dist/ritriever-0.2.5.zip`
 
 ## 既知の制限
 

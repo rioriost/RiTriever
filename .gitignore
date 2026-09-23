@@ -25,7 +25,7 @@ output/
 *.sublime-workspace
 *.sublime-project
 
-# Local Docker environment overrides. Keep .env.example tracked.
+# Local environment overrides. Keep .env.example tracked.
 .env
 
 # Local review notes, WXR imports, and plugin-directory email archives.

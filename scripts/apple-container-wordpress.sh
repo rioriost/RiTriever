@@ -3,13 +3,28 @@ set -eu
 
 ACTION="${1:-up}"
 ROOT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
+. "$ROOT_DIR/scripts/apple-container-runtime.sh"
+DB_KIND="${RITRIEVER_TEST_DB:-mariadb}"
+case "$DB_KIND" in
+  mariadb)
+    DB_IMAGE="mariadb:${RITRIEVER_MARIADB_VERSION:-11.8}"
+    DB_CLIENT=mariadb
+    DB_ENV=MARIADB
+    ;;
+  mysql)
+    DB_IMAGE="mysql:${RITRIEVER_MYSQL_VERSION:-9.4}"
+    DB_CLIENT=mysql
+    DB_ENV=MYSQL
+    ;;
+  *) echo "RITRIEVER_TEST_DB must be mariadb or mysql." >&2; exit 2 ;;
+esac
 
 APPLE_CONTAINER_NETWORK="${APPLE_CONTAINER_NETWORK:-ritriever-net}"
 APPLE_CONTAINER_DB="${APPLE_CONTAINER_DB:-ritriever-db}"
 APPLE_CONTAINER_WP="${APPLE_CONTAINER_WP:-ritriever-wp}"
 APPLE_CONTAINER_DB_VOLUME="${APPLE_CONTAINER_DB_VOLUME:-ritriever_mariadb_data}"
 APPLE_CONTAINER_WP_VOLUME="${APPLE_CONTAINER_WP_VOLUME:-ritriever_wp_html}"
-APPLE_CONTAINER_DB_IMAGE="${APPLE_CONTAINER_DB_IMAGE:-mariadb:${RITRIEVER_MARIADB_VERSION:-11.8}}"
+APPLE_CONTAINER_DB_IMAGE="${APPLE_CONTAINER_DB_IMAGE:-$DB_IMAGE}"
 APPLE_CONTAINER_WP_IMAGE="${APPLE_CONTAINER_WP_IMAGE:-wordpress:php8.3-apache}"
 APPLE_CONTAINER_WPCLI_IMAGE="${APPLE_CONTAINER_WPCLI_IMAGE:-wordpress:cli-php8.3}"
 APPLE_CONTAINER_WP_PORT="${APPLE_CONTAINER_WP_PORT:-8081}"
@@ -24,13 +39,6 @@ WP_ADMIN_USER="${WP_ADMIN_USER:-admin}"
 WP_ADMIN_PASSWORD="${WP_ADMIN_PASSWORD:-password}"
 WP_ADMIN_EMAIL="${WP_ADMIN_EMAIL:-admin@example.test}"
 WORDPRESS_VERSION="${RITRIEVER_WORDPRESS_VERSION:-}"
-
-need_container() {
-  if ! command -v container >/dev/null 2>&1; then
-    echo "Apple container CLI not found." >&2
-    exit 1
-  fi
-}
 
 ensure_network() {
   container network inspect "$APPLE_CONTAINER_NETWORK" >/dev/null 2>&1 ||
@@ -47,7 +55,7 @@ container_exists() {
 }
 
 start_existing() {
-  container start "$1" >/dev/null 2>&1 || true
+  container start "$1" >/dev/null
 }
 
 run_wpcli() {
@@ -102,13 +110,13 @@ PHP
 wait_for_db() {
   i=0
   while [ "$i" -lt 60 ]; do
-    if container exec "$APPLE_CONTAINER_DB" mariadb-admin ping -h 127.0.0.1 -u"$WP_DB_USER" -p"$WP_DB_PASSWORD" --silent >/dev/null 2>&1; then
+    if container exec "$APPLE_CONTAINER_DB" "$DB_CLIENT" -h 127.0.0.1 -u"$WP_DB_USER" -p"$WP_DB_PASSWORD" "$WP_DB_NAME" -e "SELECT 1" >/dev/null 2>&1; then
       return
     fi
     i=$((i + 1))
     sleep 2
   done
-  echo "Timed out waiting for MariaDB container ${APPLE_CONTAINER_DB}." >&2
+  echo "Timed out waiting for ${DB_KIND} container ${APPLE_CONTAINER_DB}." >&2
   container logs "$APPLE_CONTAINER_DB" >&2 || true
   exit 1
 }
@@ -149,10 +157,10 @@ up() {
       --name "$APPLE_CONTAINER_DB" \
       --network "$APPLE_CONTAINER_NETWORK" \
       --mount "type=volume,source=${APPLE_CONTAINER_DB_VOLUME},target=/var/lib/mysql" \
-      -e "MARIADB_DATABASE=${WP_DB_NAME}" \
-      -e "MARIADB_USER=${WP_DB_USER}" \
-      -e "MARIADB_PASSWORD=${WP_DB_PASSWORD}" \
-      -e "MARIADB_ROOT_PASSWORD=${WP_DB_ROOT_PASSWORD}" \
+      -e "${DB_ENV}_DATABASE=${WP_DB_NAME}" \
+      -e "${DB_ENV}_USER=${WP_DB_USER}" \
+      -e "${DB_ENV}_PASSWORD=${WP_DB_PASSWORD}" \
+      -e "${DB_ENV}_ROOT_PASSWORD=${WP_DB_ROOT_PASSWORD}" \
       "$APPLE_CONTAINER_DB_IMAGE" \
       --character-set-server=utf8mb4 \
       --collation-server=utf8mb4_unicode_ci >/dev/null
@@ -200,15 +208,23 @@ up() {
 
 down() {
   need_container
-  container delete --force "$APPLE_CONTAINER_WP" >/dev/null 2>&1 || true
-  container delete --force "$APPLE_CONTAINER_DB" >/dev/null 2>&1 || true
-  container network delete "$APPLE_CONTAINER_NETWORK" >/dev/null 2>&1 || true
+  for name in "$APPLE_CONTAINER_WP" "$APPLE_CONTAINER_DB" "${APPLE_CONTAINER_MOCK:-}"; do
+    if [ -n "$name" ] && container_exists "$name"; then
+      container delete --force "$name" >/dev/null
+    fi
+  done
+  if container network inspect "$APPLE_CONTAINER_NETWORK" >/dev/null 2>&1; then
+    container network delete "$APPLE_CONTAINER_NETWORK" >/dev/null
+  fi
 }
 
 reset() {
   down
-  container volume delete "$APPLE_CONTAINER_WP_VOLUME" >/dev/null 2>&1 || true
-  container volume delete "$APPLE_CONTAINER_DB_VOLUME" >/dev/null 2>&1 || true
+  for volume in "$APPLE_CONTAINER_WP_VOLUME" "$APPLE_CONTAINER_DB_VOLUME"; do
+    if container volume inspect "$volume" >/dev/null 2>&1; then
+      container volume delete "$volume" >/dev/null
+    fi
+  done
 }
 
 status() {

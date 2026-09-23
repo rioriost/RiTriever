@@ -12,6 +12,7 @@ namespace RiTriever;
 final class LanguageOptions
 {
     public const SITE_DEFAULT = "site";
+    public const CONTEXT_VERSION = "locale-v2";
 
     private function __construct() {}
 
@@ -46,11 +47,11 @@ final class LanguageOptions
     public static function embedding_context_prefix(): string
     {
         $locale = self::selected_locale();
-        return "Search target language: " .
-            self::label_for_locale($locale) .
-            " (" .
+        return "RiTriever embedding context: " .
+            self::CONTEXT_VERSION .
+            "\nSearch target locale: " .
             $locale .
-            ")\n\n";
+            "\n\n";
     }
 
     public static function with_embedding_context(string $text): string
@@ -80,6 +81,11 @@ final class LanguageOptions
                 $translation_locale,
                 is_array($translation) ? $translation : [],
             );
+        }
+
+        $saved = self::sanitize_locale((string) Settings::get("target_locale"));
+        if ($saved !== self::SITE_DEFAULT && !isset($options[$saved])) {
+            $options[$saved] = str_replace("_", "-", $saved);
         }
 
         $site_default = $options[self::SITE_DEFAULT];

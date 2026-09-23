@@ -2,12 +2,8 @@
   "use strict";
 
   var config = window.ritrieverBackfill || null;
-  if (!config) {
-    return;
-  }
-
   var root = document.getElementById("ritriever-backfill-progress");
-  if (!root) {
+  if (!config || !root) {
     return;
   }
 
@@ -16,9 +12,14 @@
   var bar = root.querySelector("[data-ritriever-progress-bar]");
   var percentText = root.querySelector("[data-ritriever-percent]");
   var controls = root.querySelectorAll("[data-ritriever-control]");
-  var activeWorkers = 0;
-  var stopped = false;
   var currentStatus = "idle";
+  var runAllowed = !!config.autoStart;
+  var workerActive = false;
+  var controlActive = false;
+  var timer = null;
+  var epoch = 0;
+  var requestId = 0;
+  var appliedRequestId = 0;
   var consecutiveErrors = 0;
 
   function setMessage(message) {
@@ -27,34 +28,26 @@
     }
   }
 
-  function setControlStates(status) {
+  function runnable(status) {
+    return status === "queued" || status === "running";
+  }
+
+  function setControlStates() {
     Array.prototype.forEach.call(controls, function (button) {
       var action = button.getAttribute("data-ritriever-control");
-      if (action === "pause") {
-        button.disabled = !(status === "queued" || status === "running");
-      } else if (action === "resume") {
-        button.disabled = status !== "paused";
-      } else if (action === "cancel") {
-        button.disabled = !(
-          status === "queued" ||
-          status === "running" ||
-          status === "paused"
-        );
-      }
+      button.disabled = controlActive || (
+        action === "pause" ? !runnable(currentStatus) :
+        action === "resume" ? currentStatus !== "paused" :
+        !(runnable(currentStatus) || currentStatus === "paused")
+      );
     });
   }
 
   function updateProgress(state) {
-    if (!state) {
-      return;
-    }
-
     var total = Math.max(0, parseInt(state.total, 10) || 0);
     var processed = Math.max(0, parseInt(state.processed, 10) || 0);
     var errors = Math.max(0, parseInt(state.errors, 10) || 0);
-    var percent =
-      total > 0 ? Math.floor((Math.min(processed, total) / total) * 100) : 0;
-
+    var percent = total > 0 ? Math.floor(Math.min(processed, total) / total * 100) : 0;
     currentStatus = state.status || "idle";
     if (bar) {
       bar.style.width = percent + "%";
@@ -64,143 +57,136 @@
     }
     if (statusText) {
       statusText.textContent = config.i18n.progress
-        .replace("%1$d", processed)
-        .replace("%2$d", total)
-        .replace("%3$d", errors);
+        .replace("%1$d", processed).replace("%2$d", total).replace("%3$d", errors);
+      if (config.i18n.remaining && state.remaining !== undefined) {
+        statusText.textContent += " " + config.i18n.remaining
+          .replace("%1$d", state.remaining)
+          .replace("%2$d", state.remaining_failures === undefined ? errors : state.remaining_failures);
+      }
     }
-    if (state.message) {
-      setMessage(state.message);
-    }
-    setControlStates(currentStatus);
+    setMessage(state.message || (
+      currentStatus === "complete" ? config.i18n.complete :
+      currentStatus === "failed" || currentStatus === "completed_with_errors" ? config.i18n.failed :
+      runnable(currentStatus) ? config.i18n.running : config.i18n.idle
+    ));
+    setControlStates();
   }
 
-  function request(action) {
+  function clearTimer() {
+    if (timer !== null) {
+      window.clearTimeout(timer);
+      timer = null;
+    }
+  }
+
+  function schedule(callback, delay) {
+    clearTimer();
+    timer = window.setTimeout(function () {
+      timer = null;
+      callback();
+    }, delay);
+  }
+
+  function request(action, generation) {
+    var id = ++requestId;
     var formData = new window.FormData();
     formData.append("action", action);
     formData.append("nonce", config.nonce);
-
-    return window
-      .fetch(config.ajaxUrl, {
-        method: "POST",
-        credentials: "same-origin",
-        body: formData,
-      })
-      .then(function (response) {
-        if (!response.ok) {
-          throw new Error("HTTP " + response.status);
-        }
-        return response.json();
-      })
-      .then(function (payload) {
-        if (!payload || !payload.success) {
-          var message =
-            payload && payload.data && payload.data.message
-              ? payload.data.message
-              : config.i18n.failed;
-          throw new Error(message);
-        }
-        return payload.data;
-      });
+    return window.fetch(config.ajaxUrl, {
+      method: "POST",
+      credentials: "same-origin",
+      body: formData,
+    }).then(function (response) {
+      if (!response.ok) {
+        throw new Error("HTTP " + response.status);
+      }
+      return response.json();
+    }).then(function (payload) {
+      if (generation !== epoch || id < appliedRequestId) {
+        return null;
+      }
+      if (!payload || !payload.success || !payload.data) {
+        throw new Error(payload && payload.data && payload.data.message || config.i18n.failed);
+      }
+      appliedRequestId = id;
+      consecutiveErrors = 0;
+      updateProgress(payload.data);
+      return payload.data;
+    });
   }
 
-  function isRunnable(status) {
-    return status === "queued" || status === "running";
-  }
-
-  function finish(state) {
-    stopped = true;
-    updateProgress(state);
-    if (state && state.status === "complete") {
-      setMessage(config.i18n.complete);
+  function onError(error, generation, retry) {
+    if (generation !== epoch) {
       return;
     }
-    if (state && state.status === "failed") {
-      setMessage(config.i18n.failed);
+    consecutiveErrors += 1;
+    if (consecutiveErrors >= (config.maxConsecutiveErrors || 5)) {
+      runAllowed = false;
+      setMessage(config.i18n.failed + " " + error.message);
+      setControlStates();
       return;
     }
-    if (state && state.status === "paused") {
-      setMessage(state.message || config.i18n.idle);
-      return;
-    }
-    if (state && state.status === "cancelled") {
-      setMessage(state.message || config.i18n.failed);
-      return;
-    }
-    setMessage(config.i18n.idle);
-  }
-
-  function workerTick() {
-    if (stopped || !isRunnable(currentStatus)) {
-      return;
-    }
-
-    activeWorkers += 1;
-    setMessage(config.i18n.running);
-
-    request("ritriever_backfill_run")
-      .then(function (state) {
-        activeWorkers -= 1;
-        consecutiveErrors = 0;
-        updateProgress(state);
-        if (isRunnable(state.status)) {
-          window.setTimeout(workerTick, config.delayMs || 500);
-        } else if (activeWorkers <= 0) {
-          finish(state);
-        }
-      })
-      .catch(function (error) {
-        activeWorkers -= 1;
-        consecutiveErrors += 1;
-        if (consecutiveErrors >= (config.maxConsecutiveErrors || 5)) {
-          stopped = true;
-          setMessage(config.i18n.failed + " " + error.message);
-          setControlStates(currentStatus);
-          return;
-        }
-        setMessage(config.i18n.retrying.replace("%s", error.message));
-        window.setTimeout(workerTick, config.errorDelayMs || 5000);
-      });
+    setMessage(config.i18n.retrying.replace("%s", error.message));
+    schedule(retry, config.errorDelayMs || 5000);
   }
 
   function startWorkers() {
-    if (stopped || !isRunnable(currentStatus)) {
+    if (!runAllowed || controlActive || workerActive || timer !== null || !runnable(currentStatus)) {
       return;
     }
-
-    var desired = Math.max(
-      1,
-      Math.min(3, parseInt(config.concurrency, 10) || 1),
-    );
-    while (activeWorkers < desired) {
-      workerTick();
-    }
+    workerActive = true;
+    var generation = epoch;
+    request("ritriever_backfill_run", generation)
+      .catch(function (error) {
+        onError(error, generation, startWorkers);
+      })
+      .then(function () {
+        workerActive = false;
+        if (runAllowed && !controlActive && runnable(currentStatus) && timer === null) {
+          schedule(startWorkers, config.delayMs || 500);
+        }
+      });
   }
 
-  function control(action) {
-    if (action === "cancel" && !window.confirm(config.i18n.confirmCancel)) {
-      return;
-    }
-
-    if (action === "resume") {
-      stopped = false;
-      consecutiveErrors = 0;
-    }
-
-    request("ritriever_backfill_" + action)
+  function readStatus() {
+    var generation = epoch;
+    request("ritriever_backfill_status", generation)
       .then(function (state) {
-        updateProgress(state);
-        if (action === "pause" || action === "cancel") {
-          stopped = true;
-          setMessage(state.message);
-          return;
-        }
-        if (action === "resume" && isRunnable(state.status)) {
-          stopped = false;
+        if (state) {
           startWorkers();
         }
       })
       .catch(function (error) {
+        // Retry status itself: an initial failure has no runnable state yet.
+        onError(error, generation, readStatus);
+      });
+  }
+
+  function control(action) {
+    if (controlActive || (action === "cancel" && !window.confirm(config.i18n.confirmCancel))) {
+      return;
+    }
+    epoch += 1;
+    var generation = epoch;
+    clearTimer();
+    controlActive = true;
+    setControlStates();
+    request("ritriever_backfill_" + action, generation)
+      .then(function (state) {
+        controlActive = false;
+        if (!state) {
+          return;
+        }
+        runAllowed = action === "resume";
+        setControlStates();
+        startWorkers();
+      })
+      .catch(function (error) {
+        controlActive = false;
         setMessage(config.i18n.retrying.replace("%s", error.message));
+        setControlStates();
+        // The operation may have reached the server; reconcile instead of guessing.
+        readStatus();
       });
   }
 
@@ -209,20 +195,6 @@
       control(button.getAttribute("data-ritriever-control"));
     });
   });
-
-  request("ritriever_backfill_status")
-    .then(function (state) {
-      updateProgress(state);
-      if (config.autoStart && isRunnable(state.status)) {
-        stopped = false;
-        startWorkers();
-      } else {
-        setControlStates(state.status);
-      }
-    })
-    .catch(function (error) {
-      consecutiveErrors += 1;
-      setMessage(config.i18n.retrying.replace("%s", error.message));
-      window.setTimeout(startWorkers, config.errorDelayMs || 5000);
-    });
+  setControlStates();
+  readStatus();
 })();

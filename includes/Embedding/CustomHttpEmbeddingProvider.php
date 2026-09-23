@@ -23,14 +23,35 @@ final class CustomHttpEmbeddingProvider implements EmbeddingProviderInterface
 
     public function embed_many(array $texts): array
     {
+        if ((bool) Settings::get("kill_switch_global")) {
+            throw new EmbeddingProviderException("RiTriever is globally stopped. No embedding request was sent.");
+        }
+        if ($texts === []) {
+            return [];
+        }
         $url = (string) Settings::get("custom_embedding_endpoint");
         if ($url === "") {
             throw new \RuntimeException("Custom embedding endpoint is empty.");
+        }
+        $parts = wp_parse_url($url);
+        if (
+            !is_array($parts) ||
+            !in_array(strtolower((string) ($parts["scheme"] ?? "")), ["http", "https"], true) ||
+            trim((string) ($parts["host"] ?? "")) === "" ||
+            preg_match('/\s/', (string) $parts["host"]) === 1
+        ) {
+            throw new EmbeddingProviderException("Custom embedding endpoint must be an absolute HTTP(S) URL with a host.");
         }
         $headers = ["Content-Type" => "application/json"];
         $key = (string) Settings::get("custom_embedding_api_key");
         $model = trim((string) Settings::get("custom_embedding_model"));
         $format = (string) Settings::get("custom_embedding_format");
+        if (
+            ($format === "azure_openai" || Settings::get("embedding_provider") === "azure_openai") &&
+            preg_match('/YOUR[-_]?(?:RESOURCE|DEPLOYMENT)/i', rawurldecode($url)) === 1
+        ) {
+            throw new EmbeddingProviderException("Replace the Azure resource and deployment placeholders before connecting.");
+        }
         if ($key !== "") {
             if ($format === "azure_openai") {
                 $headers["api-key"] = $key;
@@ -42,47 +63,13 @@ final class CustomHttpEmbeddingProvider implements EmbeddingProviderInterface
         $response = wp_remote_post($url, [
             "timeout" => 30,
             "headers" => $headers,
-            "body" => wp_json_encode($body),
+            "body" => EmbeddingResponseValidator::encode_request($body, $texts),
         ]);
-        if (is_wp_error($response)) {
-            // phpcs:ignore WordPress.Security.EscapeOutput.ExceptionNotEscaped -- Exception text is not output here; admin render escapes notices.
-            throw new \RuntimeException($response->get_error_message());
-        }
-        $payload = json_decode(
-            (string) wp_remote_retrieve_body($response),
-            true,
-        );
-        if (isset($payload["embeddings"]) && is_array($payload["embeddings"])) {
-            if (
-                isset($payload["embeddings"]["float"]) &&
-                is_array($payload["embeddings"]["float"])
-            ) {
-                return array_map(
-                    static fn($v) => array_map("floatval", (array) $v),
-                    $payload["embeddings"]["float"],
-                );
-            }
-            return array_map(
-                static fn($v) => array_map("floatval", (array) $v),
-                $payload["embeddings"],
-            );
-        }
-        if (isset($payload["embedding"]) && is_array($payload["embedding"])) {
-            return [array_map("floatval", $payload["embedding"])];
-        }
-        if (isset($payload["data"]) && is_array($payload["data"])) {
-            $out = [];
-            foreach ($payload["data"] as $item) {
-                if (isset($item["embedding"]) && is_array($item["embedding"])) {
-                    $out[] = array_map("floatval", $item["embedding"]);
-                }
-            }
-            if ($out !== []) {
-                return $out;
-            }
-        }
-        throw new \RuntimeException(
-            "Custom embedding endpoint returned no embedding(s).",
+        return EmbeddingResponseValidator::from_payload(
+            EmbeddingResponseValidator::decode_response($response),
+            count($texts),
+            (int) Settings::get("embedding_dimensions"),
+            (string) Settings::get("vector_distance"),
         );
     }
 

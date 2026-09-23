@@ -5,6 +5,7 @@ namespace RiTriever\Provider;
 
 use RiTriever\Database\LocalVectorRepository;
 use RiTriever\Embedding\EmbeddingProviderFactory;
+use RiTriever\Embedding\EmbeddingResponseValidator;
 use RiTriever\LanguageOptions;
 use RiTriever\Settings;
 use RiTriever\TextNormalizer;
@@ -20,6 +21,12 @@ final class LocalVectorProvider
                     TextNormalizer::vector_query($query),
                 ),
             );
+            $embedding = EmbeddingResponseValidator::validate(
+                [$embedding],
+                1,
+                (int) Settings::get("embedding_dimensions"),
+                (string) Settings::get("vector_distance"),
+            )[0];
             $results = (new LocalVectorRepository())->search_with_chunks(
                 $embedding,
                 $embedder->model(),
@@ -28,7 +35,18 @@ final class LocalVectorProvider
             $min = (float) Settings::get("min_score");
             $hits = [];
             foreach ($results as $post_id => $result) {
-                $score = (float) ($result["score"] ?? 0.0);
+                if (
+                    !is_array($result) ||
+                    !isset($result["score"]) ||
+                    (!is_int($result["score"]) && !is_float($result["score"])) ||
+                    !is_finite((float) $result["score"]) ||
+                    !is_int($post_id) ||
+                    $post_id <= 0 ||
+                    !is_string($result["chunk_text"] ?? null)
+                ) {
+                    throw new \UnexpectedValueException("Vector search returned an invalid hit.");
+                }
+                $score = (float) $result["score"];
                 if ($score >= $min) {
                     $hits[] = new ResultHit(
                         (int) $post_id,
@@ -39,7 +57,7 @@ final class LocalVectorProvider
                 }
             }
             return RetrieveResult::success($hits);
-        } catch (\Throwable $e) {
+        } catch (\RuntimeException $e) {
             return RetrieveResult::failure($e->getMessage());
         }
     }

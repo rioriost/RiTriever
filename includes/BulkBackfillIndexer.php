@@ -1,6 +1,6 @@
 <?php
 /**
- * Bulk indexing pipeline for initial backfill jobs.
+ * Shared, generation-fenced indexing for initial builds and live updates.
  *
  * @package RiTriever
  */
@@ -9,283 +9,168 @@ declare(strict_types=1);
 
 namespace RiTriever;
 
+use RiTriever\Database\DatabaseLock;
 use RiTriever\Database\LocalVectorRepository;
 use RiTriever\Embedding\EmbeddingProviderFactory;
-use RiTriever\Embedding\EmbeddingProviderInterface;
 
 final class BulkBackfillIndexer
 {
     private const EMBEDDING_CHUNK_BATCH_SIZE = 96;
 
-    private function __construct() {}
-
     /**
      * @param int[] $post_ids
-     * @return array{errors:int,failed_ids:int[]}
+     * @return array{errors:int,failed_ids:int[],failures:array<int,\Throwable>,stale_ids:int[]}
      */
-    public static function process_posts(array $post_ids): array
+    public static function process_posts(array $post_ids, ?callable $job_guard = null): array
     {
-        $post_ids = array_values(
-            array_filter(
-                array_map("intval", $post_ids),
-                static fn(int $post_id): bool => $post_id > 0,
-            ),
-        );
-        if ($post_ids === []) {
-            return ["errors" => 0, "failed_ids" => []];
-        }
-
-        $embedder = EmbeddingProviderFactory::make();
-        $model = $embedder->model();
+        Settings::refresh();
+        $post_ids = array_values(array_unique(array_filter(array_map("intval", $post_ids), static fn(int $id): bool => $id > 0)));
         $repository = new LocalVectorRepository();
+        $generation = IndexState::generation();
+        if (!IndexState::is_writable() || !IndexState::can_sync()) {
+            throw new StaleIndexWork("Index requires explicit initialization or has been stopped.");
+        }
+        $fingerprint = IndexState::fingerprint();
         $items = [];
-        $chunk_jobs = [];
-        $failed = [];
+        $jobs = [];
+        $failures = [];
+        $stale = [];
+        $embedder = null;
 
         foreach ($post_ids as $post_id) {
-            if (!PostFilter::is_eligible($post_id)) {
-                $repository->delete_post($post_id);
-                delete_post_meta($post_id, RITRIEVER_POSTMETA_LAST_ERROR);
-                continue;
-            }
-
-            $text = PostSync::post_text($post_id);
-            $hash = hash(
-                "sha256",
-                $text .
-                    "|" .
-                        LanguageOptions::selected_locale() .
-                    "|" .
-                        $model .
-                        "|" .
-                        (string) Settings::get("embedding_dimensions"),
-            );
-            if (
-                get_post_meta(
-                    $post_id,
-                    RITRIEVER_POSTMETA_CONTENT_HASH,
-                    true,
-                ) === $hash
-            ) {
-                delete_post_meta($post_id, RITRIEVER_POSTMETA_LAST_ERROR);
-                continue;
-            }
-
-            $chunks = PostSync::chunk_text($text);
-            if ($chunks === []) {
-                $repository->delete_post($post_id);
-                update_post_meta(
-                    $post_id,
-                    RITRIEVER_POSTMETA_CONTENT_HASH,
-                    $hash,
-                );
-                update_post_meta(
-                    $post_id,
-                    RITRIEVER_POSTMETA_INDEXED_AT,
-                    time(),
-                );
-                delete_post_meta($post_id, RITRIEVER_POSTMETA_LAST_ERROR);
-                continue;
-            }
-
-            $items[$post_id] = [
-                "post_id" => $post_id,
-                "model" => $model,
-                "content_hash" => $hash,
-                "chunks" => $chunks,
-                "embeddings" => [],
-            ];
-
-            foreach ($chunks as $chunk_index => $chunk) {
-                $chunk_jobs[] = [
-                    "post_id" => $post_id,
-                    "chunk_index" => (int) $chunk_index,
-                    "text" => $chunk,
-                ];
-            }
-        }
-
-        foreach (
-            array_chunk($chunk_jobs, self::EMBEDDING_CHUNK_BATCH_SIZE)
-            as $job_batch
-        ) {
-            self::embed_chunk_batch($embedder, $job_batch, $items, $failed);
-        }
-
-        $ready_items = [];
-        foreach ($items as $post_id => $item) {
-            $post_id = (int) $post_id;
-            if (isset($failed[$post_id])) {
-                update_post_meta(
-                    $post_id,
-                    RITRIEVER_POSTMETA_LAST_ERROR,
-                    (string) $failed[$post_id],
-                );
-                continue;
-            }
-
-            $chunks = is_array($item["chunks"] ?? null) ? $item["chunks"] : [];
-            $embeddings = is_array($item["embeddings"] ?? null)
-                ? $item["embeddings"]
-                : [];
-            ksort($embeddings);
-            if (count($embeddings) !== count($chunks)) {
-                $failed[$post_id] =
-                    "Embedding response count did not match chunk count.";
-                update_post_meta(
-                    $post_id,
-                    RITRIEVER_POSTMETA_LAST_ERROR,
-                    (string) $failed[$post_id],
-                );
-                continue;
-            }
-
-            $ready_items[$post_id] = [
-                "post_id" => $post_id,
-                "model" => (string) $item["model"],
-                "content_hash" => (string) $item["content_hash"],
-                "chunks" => $chunks,
-                "embeddings" => array_values($embeddings),
-            ];
-        }
-
-        if ($ready_items !== []) {
-            $repository->replace_many_post_embeddings(
-                array_values($ready_items),
-            );
-        }
-
-        foreach ($ready_items as $post_id => $item) {
-            update_post_meta(
-                $post_id,
-                RITRIEVER_POSTMETA_CONTENT_HASH,
-                (string) $item["content_hash"],
-            );
-            update_post_meta(
-                $post_id,
-                RITRIEVER_POSTMETA_INDEXED_AT,
-                time(),
-            );
-            delete_post_meta($post_id, RITRIEVER_POSTMETA_LAST_ERROR);
-        }
-
-        if ($ready_items !== []) {
-            SearchInterceptor::purge_query_cache();
-        }
-
-        $failed_ids = array_values(array_map("intval", array_keys($failed)));
-        return ["errors" => count($failed_ids), "failed_ids" => $failed_ids];
-    }
-
-    /**
-     * @param array<int,array{post_id:int,chunk_index:int,text:string}> $jobs
-     * @param array<int,array<string,mixed>> $items
-     * @param array<int,string> $failed
-     */
-    private static function embed_chunk_batch(
-        EmbeddingProviderInterface $embedder,
-        array $jobs,
-        array &$items,
-        array &$failed,
-    ): void {
-        if ($jobs === []) {
-            return;
-        }
-
-        try {
-            $texts = array_map(
-                static fn(array $job): string => (string) $job["text"],
-                $jobs,
-            );
-            $texts = PostSync::embedding_texts_for_chunks($texts);
-            $embeddings = $embedder->embed_many($texts);
-            if (count($embeddings) !== count($jobs)) {
-                throw new \RuntimeException(
-                    "Embedding response count did not match request count.",
-                );
-            }
-
-            foreach ($jobs as $offset => $job) {
-                $post_id = (int) $job["post_id"];
-                $chunk_index = (int) $job["chunk_index"];
-                if (isset($failed[$post_id]) || !isset($items[$post_id])) {
+            try {
+                PostSync::refresh_post($post_id);
+                if (!PostFilter::is_eligible($post_id)) {
+                    DatabaseLock::with("lifecycle", static function () use ($repository, $post_id, $generation, $job_guard): void {
+                        self::guard($post_id, $generation, null, $job_guard);
+                        $repository->delete_post($post_id);
+                    });
                     continue;
                 }
-                $embedding = $embeddings[$offset] ?? null;
-                if (!is_array($embedding) || $embedding === []) {
-                    throw new \RuntimeException(
-                        "Embedding response was empty.",
-                    );
+                $text = PostSync::post_text($post_id);
+                $hash = PostSync::hash_text($text);
+                if ($repository->has_current($post_id, $hash, $generation)) {
+                    DatabaseLock::with("lifecycle", static function () use ($post_id, $generation, $hash, $job_guard): void {
+                        self::guard($post_id, $generation, $hash, $job_guard);
+                    });
+                    continue;
                 }
-                $items[$post_id]["embeddings"][$chunk_index] = array_map(
-                    "floatval",
-                    $embedding,
+                $chunks = PostSync::chunk_text($text);
+                $embedder = $embedder ?? EmbeddingProviderFactory::make();
+                $items[$post_id] = [
+                    "post_id" => $post_id, "model" => $embedder->model(),
+                    "content_hash" => $hash, "chunks" => $chunks, "embeddings" => [],
+                ];
+                foreach ($chunks as $index => $chunk) {
+                    $jobs[] = ["post_id" => $post_id, "index" => $index, "text" => $chunk];
+                }
+            } catch (StaleIndexWork $e) {
+                $stale[] = $post_id;
+            } catch (\RuntimeException $e) {
+                $failures[$post_id] = $e;
+            }
+        }
+
+        foreach (array_chunk($jobs, self::EMBEDDING_CHUNK_BATCH_SIZE) as $batch) {
+            try {
+                if (IndexState::generation() !== $generation || !IndexState::is_writable() || !IndexState::can_sync()) {
+                    throw new StaleIndexWork("Index changed before provider request.");
+                }
+                $vectors = self::embed_batch($embedder, $batch);
+                foreach ($batch as $offset => $job) {
+                    $items[$job["post_id"]]["embeddings"][$job["index"]] = $vectors[$offset];
+                }
+            } catch (StaleIndexWork $e) {
+                foreach ($batch as $job) {
+                    $stale[] = $job["post_id"];
+                }
+            } catch (\RuntimeException $e) {
+                foreach ($batch as $job) {
+                    $failures[$job["post_id"]] = $e;
+                }
+                if (BackfillRunner::is_retryable($e) || in_array((int) $e->getCode(), [401, 403], true)) {
+                    foreach ($jobs as $job) {
+                        $failures[$job["post_id"]] = $e;
+                    }
+                    break;
+                }
+            }
+        }
+
+        foreach ($items as $post_id => $item) {
+            if (isset($failures[$post_id]) || in_array($post_id, $stale, true)) {
+                continue;
+            }
+            try {
+                ksort($item["embeddings"]);
+                $repository->replace_post_embeddings(
+                    $post_id, $item["model"], $item["content_hash"], $item["chunks"],
+                    array_values($item["embeddings"]), $generation,
+                    static function (int $id) use ($generation, $fingerprint, $item, $job_guard): void {
+                        if (IndexState::fingerprint() !== $fingerprint) {
+                            throw new StaleIndexWork("Embedding settings changed.");
+                        }
+                        self::guard($id, $generation, $item["content_hash"], $job_guard);
+                    },
                 );
-            }
-        } catch (\Throwable $e) {
-            if (count($jobs) > 1 && self::should_split_failed_batch($e)) {
-                $halves = array_chunk($jobs, (int) ceil(count($jobs) / 2));
-                foreach ($halves as $half) {
-                    self::embed_chunk_batch($embedder, $half, $items, $failed);
+                // An edit whose hooks run just after COMMIT is queued independently.
+                // Reconcile a change already visible before this worker acknowledges.
+                PostSync::refresh_post($post_id);
+                if (!PostFilter::is_eligible($post_id) || PostSync::content_hash($post_id) !== $item["content_hash"]) {
+                    BackfillRunner::enqueue_posts([$post_id]);
+                    $stale[] = $post_id;
                 }
-                return;
+                SearchInterceptor::purge_query_cache();
+            } catch (StaleIndexWork $e) {
+                $stale[] = $post_id;
+            } catch (\RuntimeException $e) {
+                $failures[$post_id] = $e;
             }
+        }
 
-            if (count($jobs) > 1) {
-                throw $e;
-            }
+        return [
+            "errors" => count($failures), "failed_ids" => array_map("intval", array_keys($failures)),
+            "failures" => $failures, "stale_ids" => array_values(array_unique($stale)),
+        ];
+    }
 
-            $post_id = (int) ($jobs[0]["post_id"] ?? 0);
-            if ($post_id > 0) {
-                $failed[$post_id] = $e->getMessage();
+    private static function embed_batch(object $embedder, array $jobs): array
+    {
+        try {
+            $vectors = $embedder->embed_many(PostSync::embedding_texts_for_chunks(array_column($jobs, "text")));
+            if (count($vectors) !== count($jobs)) {
+                throw new \RuntimeException("Embedding count does not match the requested chunks.");
             }
+            return $vectors;
+        } catch (\RuntimeException $e) {
+            if (count($jobs) > 1 && !BackfillRunner::is_retryable($e) &&
+                !in_array((int) $e->getCode(), [401, 403], true) &&
+                preg_match('/count|too large|maximum|context|token|payload|input|empty/i', $e->getMessage()) === 1) {
+                $vectors = [];
+                foreach (array_chunk($jobs, (int) ceil(count($jobs) / 2)) as $half) {
+                    $vectors = array_merge($vectors, self::embed_batch($embedder, $half));
+                }
+                return $vectors;
+            }
+            throw $e;
         }
     }
 
-    private static function should_split_failed_batch(\Throwable $e): bool
+    private static function guard(int $post_id, string $generation, ?string $hash, ?callable $job_guard): void
     {
-        $message = strtolower($e->getMessage());
-        foreach (
-            [
-                "429",
-                "401",
-                "403",
-                "500",
-                "502",
-                "503",
-                "504",
-                "rate limit",
-                "timeout",
-                "timed out",
-                "connection",
-                "could not resolve",
-                "api key",
-            ]
-            as $transient_or_auth_error
-        ) {
-            if (str_contains($message, $transient_or_auth_error)) {
-                return false;
-            }
+        if (IndexState::generation() !== $generation || !IndexState::is_writable() || !IndexState::can_sync()) {
+            throw new StaleIndexWork("Index generation changed.");
         }
-
-        foreach (
-            [
-                "count",
-                "too large",
-                "maximum",
-                "context",
-                "token",
-                "payload",
-                "input",
-                "empty",
-            ]
-            as $batch_shape_error
-        ) {
-            if (str_contains($message, $batch_shape_error)) {
-                return true;
-            }
+        if ($job_guard !== null) {
+            $job_guard($post_id);
         }
-
-        return false;
+        PostSync::refresh_post($post_id);
+        if ($hash === null) {
+            if (PostFilter::is_eligible($post_id)) {
+                throw new StaleIndexWork("Post was republished during indexing.");
+            }
+        } elseif (!PostFilter::is_eligible($post_id) || PostSync::content_hash($post_id) !== $hash) {
+            throw new StaleIndexWork("Post changed during embedding; current content will be retried.");
+        }
     }
 }

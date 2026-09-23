@@ -1,6 +1,6 @@
 <?php
 /**
- * Shared backfill queue runner for admin and WP-CLI initialization flows.
+ * Durable background queue with connection-owned workers and revision fences.
  *
  * @package RiTriever
  */
@@ -9,9 +9,10 @@ declare(strict_types=1);
 
 namespace RiTriever;
 
-// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching,WordPress.DB.PreparedSQLPlaceholders.UnfinishedPrepare,WordPress.DB.PreparedSQLPlaceholders.ReplacementsWrongNumber,Squiz.PHP.DiscouragedFunctions.Discouraged -- Backfill jobs are stored in custom queue tables and require atomic SQL updates that are not covered by WordPress cache APIs.
-
 use RiTriever\Database\BackfillQueueSchema;
+use RiTriever\Database\DatabaseLock;
+use RiTriever\Database\LocalVectorRepository;
+use RiTriever\Database\Sql;
 use RiTriever\Database\VectorSchema;
 
 final class BackfillRunner
@@ -19,777 +20,616 @@ final class BackfillRunner
     public const OPTION_KEY = "ritriever_backfill_queue";
     public const CRON_HOOK = "ritriever_process_backfill_queue";
     public const DEFAULT_BATCH_SIZE = 20;
-    private const STALE_LOCK_MINUTES = 15;
-    private const PROCESS_LOCK_OPTION = "ritriever_backfill_process_lock";
-    private const PROCESS_LOCK_TTL_SECONDS = 120;
-
-    private function __construct() {}
+    public const MAX_ATTEMPTS = 5;
 
     public static function register(): void
     {
         add_action(self::CRON_HOOK, [self::class, "process_scheduled"]);
+        add_filter("cron_schedules", [self::class, "cron_schedules"]);
     }
 
-    /** @return array<string,mixed> */
+    public static function cron_schedules(array $schedules): array
+    {
+        $schedules["ritriever_minute"] = ["interval" => 60, "display" => "RiTriever watchdog"];
+        return $schedules;
+    }
+
     public static function status(): array
     {
         BackfillQueueSchema::install_or_upgrade();
-        $job = self::latest_job(false);
-        if (!is_array($job)) {
-            return self::idle_state();
-        }
-        return self::job_state($job);
+        $job = self::latest_job();
+        return $job === null ? self::idle_state() : self::job_state($job);
     }
 
-    /** @return array<string,mixed> */
     public static function create_queue(): array
     {
-        BackfillQueueSchema::install_or_upgrade();
-        self::clear_queue_rows();
-
-        $ids = self::eligible_post_ids();
-        $now = gmdate("Y-m-d H:i:s");
-        $status = $ids === [] ? "complete" : "queued";
-        $phase = $ids === [] ? "complete" : "queued";
-
-        VectorSchema::recreate();
-        if ($ids !== []) {
-            VectorSchema::drop_vector_index();
-        }
-
-        global $wpdb;
-        $jobs = BackfillQueueSchema::jobs_table();
-        if ($ids === []) {
-            // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
-            $inserted = $wpdb->query(
-                $wpdb->prepare(
-                    "INSERT INTO %i (status, phase, total_posts, created_at, updated_at, completed_at, last_error) VALUES (%s, %s, %d, %s, %s, %s, '')",
-                    $jobs,
-                    $status,
-                    $phase,
-                    0,
-                    $now,
-                    $now,
-                    $now,
-                ),
-            );
-        } else {
-            // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
-            $inserted = $wpdb->query(
-                $wpdb->prepare(
-                    "INSERT INTO %i (status, phase, total_posts, created_at, updated_at, completed_at, last_error) VALUES (%s, %s, %d, %s, %s, NULL, '')",
-                    $jobs,
-                    $status,
-                    $phase,
-                    count($ids),
-                    $now,
-                    $now,
-                ),
-            );
-        }
-        if ($inserted === false) {
-            throw new \RuntimeException(
-                "Failed to create backfill job: " . esc_html($wpdb->last_error),
-            );
-        }
-
-        $job_id = (int) $wpdb->insert_id;
-        self::insert_queue_items($job_id, $ids, $now);
-
-        if ($ids === []) {
-            Settings::mark_initial_backfill_complete([
-                "processed" => 0,
-                "errors" => 0,
-                "completed_at" => time(),
-            ]);
-            VectorSchema::create_vector_index();
-        } else {
-            self::schedule_next_batch();
-        }
-
-        return self::status();
-    }
-
-    /** @return array<string,mixed> */
-    public static function process_scheduled(): array
-    {
-        return self::process_batch(self::DEFAULT_BATCH_SIZE);
-    }
-
-    /** @return array<string,mixed> */
-    public static function process_batch(
-        int $limit = self::DEFAULT_BATCH_SIZE,
-    ): array {
-        if (function_exists("set_time_limit")) {
-            @set_time_limit(0);
-        }
-
-        $process_lock_token = self::worker_token();
-        if (!self::acquire_process_lock($process_lock_token)) {
-            return self::status();
-        }
-
-        try {
+        return DatabaseLock::with("lifecycle", static function (): array {
+            global $wpdb;
             BackfillQueueSchema::install_or_upgrade();
-            $limit = max(1, min(200, $limit));
-            $job = self::latest_job(true);
-            if (!is_array($job)) {
-                return self::status();
-            }
-
-            $job_id = (int) $job["id"];
-            $status = (string) $job["status"];
-            if (!in_array($status, ["queued", "running"], true)) {
-                return self::job_state($job);
-            }
-
-            self::reset_stale_processing_items($job_id);
-            self::set_job_status($job_id, "running", "embedding", "");
-
-            $token = self::worker_token();
-            $claimed = self::claim_items($job_id, $token, $limit);
-            if ($claimed === 0) {
-                return self::finish_or_continue($job_id);
-            }
-
-            $post_ids = self::claimed_post_ids($job_id, $token);
-            if ($post_ids === []) {
-                return self::finish_or_continue($job_id);
-            }
-
+            self::stop_for_invalidation("Superseded by explicit initialization.");
+            $generation = IndexState::begin_build();
+            $job_id = 0;
             try {
-                $batch_result = BulkBackfillIndexer::process_posts($post_ids);
-            } catch (\Throwable $e) {
-                self::release_claimed_items($job_id, $token, $e->getMessage());
-                self::set_job_error($job_id, $e->getMessage());
+                $job_id = self::new_job($generation, "initial");
+                VectorSchema::recreate();
+                $ids = self::eligible_post_ids();
+                Sql::transaction(static function () use ($wpdb, $job_id, $ids): void {
+                    foreach ($ids as $post_id) {
+                        self::put_item($job_id, $post_id);
+                    }
+                    $actual = self::item_count($job_id);
+                    if ($actual !== count($ids)) {
+                        throw new \RuntimeException("Queue preparation count mismatch; initialize again.");
+                    }
+                    Sql::query($wpdb->prepare("UPDATE %i SET total_posts = %d, status = 'queued', phase = 'queued', updated_at = UTC_TIMESTAMP() WHERE id = %d AND status = 'preparing'", BackfillQueueSchema::jobs_table(), $actual, $job_id));
+                });
+                self::schedule_next_batch();
+                return self::finish_or_continue($job_id);
+            } catch (\RuntimeException $e) {
+                if ($job_id > 0) {
+                    self::fail_job($job_id, "Initialization failed; inspect database availability and explicitly retry initialization.");
+                }
+                IndexState::fail("Initialization failed; explicitly retry initialization.");
                 throw $e;
             }
+        });
+    }
 
-            $failed_ids = is_array($batch_result["failed_ids"] ?? null)
-                ? array_values(array_map("intval", $batch_result["failed_ids"]))
-                : [];
-            $failed_ids = array_values(array_intersect($post_ids, $failed_ids));
-            $done_ids = array_values(array_diff($post_ids, $failed_ids));
-
-            self::mark_claimed_items($job_id, $token, $done_ids, "done");
-            self::mark_claimed_items($job_id, $token, $failed_ids, "failed");
-
-            return self::finish_or_continue($job_id);
-        } finally {
-            self::release_process_lock($process_lock_token);
+    public static function process_scheduled(): array
+    {
+        try {
+            return self::process_batch();
+        } catch (\RuntimeException $e) {
+            // The recurring watchdog is already durable before provider/DB work.
+            Logger::error("queue", "Queue attempt failed; watchdog will retry.", ["error" => $e->getMessage()]);
+            return ["status" => "retrying", "last_error" => "Queue attempt failed; watchdog will retry."];
         }
     }
 
-    /** @return array{processed:int, errors:int, completed_at:int} */
+    public static function process_batch(int $limit = self::DEFAULT_BATCH_SIZE): array
+    {
+        Settings::refresh();
+        BackfillQueueSchema::install_or_upgrade();
+        $state = self::status();
+        if (!in_array($state["status"], ["queued", "running"], true)) {
+            return $state;
+        }
+        self::schedule_next_batch();
+        $worker = DatabaseLock::acquire("worker");
+        if ($worker === null) {
+            $state["stop_reason"] = "Another worker owns the database session lock.";
+            return $state;
+        }
+        $job_id = (int) $state["job_id"];
+        $token = bin2hex(random_bytes(16));
+        try {
+            $ids = DatabaseLock::with("lifecycle", static function () use ($worker, $job_id, $token, $limit): array {
+                global $wpdb;
+                $worker->assert_owned();
+                $job = self::job_by_id($job_id);
+                if ($job === null || !in_array($job["status"], ["queued", "running"], true)) {
+                    return [];
+                }
+                if (!IndexState::can_sync()) {
+                    self::transition($job_id, "paused", "Global synchronization is stopped.");
+                    self::unschedule();
+                    return [];
+                }
+                if (($job["index_generation"] ?? "") !== IndexState::generation() || !IndexState::is_writable()) {
+                    self::transition($job_id, "cancelled", "Index generation changed; explicitly initialize.");
+                    self::unschedule();
+                    return [];
+                }
+                // Owning the non-expiring worker lock proves no previous session
+                // can commit. Reclaim its processing rows without waiting for a TTL.
+                Sql::query($wpdb->prepare("UPDATE %i SET status = IF(attempts >= %d, 'failed', 'pending'), locked_by = '', locked_at = NULL, last_error = 'Previous worker stopped; reclaimed by watchdog.', updated_at = UTC_TIMESTAMP() WHERE job_id = %d AND status = 'processing'", BackfillQueueSchema::items_table(), self::MAX_ATTEMPTS, $job_id));
+                Sql::query($wpdb->prepare("UPDATE %i SET status = 'processing', locked_by = %s, locked_at = UTC_TIMESTAMP(), claimed_revision = revision, attempts = attempts + 1, updated_at = UTC_TIMESTAMP() WHERE job_id = %d AND status = 'pending' AND (available_at IS NULL OR available_at <= UTC_TIMESTAMP()) ORDER BY id LIMIT %d", BackfillQueueSchema::items_table(), $token, $job_id, max(1, min(200, $limit))));
+                $ids = array_map("intval", array_column(Sql::rows($wpdb->prepare("SELECT post_id FROM %i WHERE job_id = %d AND status = 'processing' AND locked_by = %s ORDER BY id", BackfillQueueSchema::items_table(), $job_id, $token)), "post_id"));
+                if ($ids !== []) {
+                    self::transition($job_id, "running", "");
+                }
+                return $ids;
+            });
+
+            if ($ids !== []) {
+                try {
+                    $result = BulkBackfillIndexer::process_posts($ids, static function (int $post_id) use ($worker, $job_id, $token): void {
+                        $worker->assert_owned();
+                        self::assert_claim($job_id, $token, $post_id);
+                    });
+                } catch (\RuntimeException $e) {
+                    $result = ["failures" => array_fill_keys($ids, $e), "stale_ids" => []];
+                }
+                DatabaseLock::with("lifecycle", static function () use ($worker, $job_id, $token, $ids, $result): void {
+                    $worker->assert_owned();
+                    foreach ($ids as $post_id) {
+                        try {
+                            self::assert_claim($job_id, $token, $post_id);
+                        } catch (StaleIndexWork $e) {
+                            continue;
+                        }
+                        if (in_array($post_id, $result["stale_ids"] ?? [], true)) {
+                            self::retry_item($job_id, $token, $post_id, new StaleIndexWork("Post changed during indexing."), true);
+                        } elseif (isset($result["failures"][$post_id])) {
+                            self::retry_item($job_id, $token, $post_id, $result["failures"][$post_id]);
+                        } else {
+                            self::complete_item($job_id, $token, $post_id);
+                        }
+                    }
+                });
+            }
+            return DatabaseLock::with("lifecycle", static fn(): array => self::finish_or_continue($job_id));
+        } finally {
+            $worker->release();
+        }
+    }
+
     public static function run(?callable $progress = null): array
     {
         $state = self::create_queue();
         while (in_array($state["status"], ["queued", "running"], true)) {
             $before = (int) $state["processed"];
-            $state = self::process_batch(self::DEFAULT_BATCH_SIZE);
-            $after = (int) $state["processed"];
-            if ($progress !== null) {
-                for ($i = $before + 1; $i <= $after; $i++) {
-                    $progress(0, $i, (int) $state["errors"]);
-                }
+            $state = self::process_batch();
+            for ($i = $before + 1; $progress !== null && $i <= (int) $state["processed"]; ++$i) {
+                $progress(0, $i, (int) $state["errors"]);
+            }
+            if ((int) $state["processed"] === $before && in_array($state["status"], ["queued", "running"], true)) {
+                throw new \RuntimeException("No immediate progress: work is locked or backing off. The cron watchdog will continue; inspect queue status.");
             }
         }
-
-        return [
-            "processed" => (int) $state["processed"],
-            "errors" => (int) $state["errors"],
-            "completed_at" => (int) $state["completed_at"],
-        ];
+        return ["processed" => (int) $state["processed"], "errors" => (int) $state["errors"], "completed_at" => (int) $state["completed_at"]];
     }
 
-    /** @return array<string,mixed> */
+    /** Queue final WordPress state, coalescing repeated hooks into one item. */
+    public static function enqueue_posts(array $post_ids): int
+    {
+        $post_ids = self::normalize_ids($post_ids);
+        if ($post_ids === [] || !IndexState::can_sync()) {
+            return 0;
+        }
+        return DatabaseLock::with("lifecycle", static function () use ($post_ids): int {
+            global $wpdb;
+            if (!IndexState::is_writable()) {
+                return 0;
+            }
+            BackfillQueueSchema::install_or_upgrade();
+            $job = self::latest_job();
+            if ($job === null || $job["index_generation"] !== IndexState::generation() || !in_array($job["status"], ["queued", "running", "paused"], true)) {
+                $job_id = self::new_job(IndexState::generation(), "sync");
+                self::transition($job_id, "queued", "");
+            } else {
+                $job_id = (int) $job["id"];
+            }
+            Sql::transaction(static function () use ($post_ids, $job_id, $wpdb): void {
+                foreach ($post_ids as $post_id) {
+                    self::put_item($job_id, $post_id);
+                }
+                Sql::query($wpdb->prepare("UPDATE %i SET total_posts = %d, updated_at = UTC_TIMESTAMP() WHERE id = %d", BackfillQueueSchema::jobs_table(), self::item_count($job_id), $job_id));
+            });
+            if (($job["status"] ?? "") !== "paused") {
+                self::schedule_next_batch();
+            }
+            return count($post_ids);
+        });
+    }
+
+    /** Counts describe enqueue results, never promise indexing success. */
+    public static function create_retry_queue(?int $post_id = null): array
+    {
+        return self::retry_failed($post_id !== null && $post_id > 0 ? [$post_id] : []);
+    }
+
+    /** Counts describe enqueue results, never promise indexing success. */
+    public static function retry_failed(array $ids = []): array
+    {
+        return DatabaseLock::with("lifecycle", static function () use ($ids): array {
+            global $wpdb;
+            BackfillQueueSchema::install_or_upgrade();
+            $job = self::latest_job();
+            if ($ids === []) {
+                $ids = array_column(Sql::rows($wpdb->prepare("SELECT DISTINCT post_id FROM %i WHERE meta_key = %s AND meta_value <> ''", $wpdb->postmeta, RITRIEVER_POSTMETA_LAST_ERROR)), "post_id");
+                if ($job !== null) {
+                    $ids = array_merge($ids, array_column(Sql::rows($wpdb->prepare("SELECT post_id FROM %i WHERE job_id = %d AND status = 'failed'", BackfillQueueSchema::items_table(), (int) $job["id"])), "post_id"));
+                }
+            }
+            $ids = self::normalize_ids($ids);
+            $eligible = array_values(array_filter($ids, static fn(int $id): bool => PostFilter::is_eligible($id)));
+            $pending = 0;
+            $active = $job !== null && in_array($job["status"], ["preparing", "queued", "running", "paused"], true);
+            if ($eligible !== [] && IndexState::can_sync() && !$active) {
+                IndexState::allow_retry();
+                $job_id = self::new_job(IndexState::generation(), "retry");
+                try {
+                    Sql::transaction(static function () use ($eligible, $job_id, $wpdb): void {
+                        foreach ($eligible as $post_id) {
+                            self::put_item($job_id, $post_id);
+                        }
+                        if (self::item_count($job_id) !== count($eligible)) {
+                            throw new \RuntimeException("Retry snapshot preparation count mismatch.");
+                        }
+                        Sql::query($wpdb->prepare("UPDATE %i SET total_posts = %d, status = 'queued', phase = 'queued', updated_at = UTC_TIMESTAMP() WHERE id = %d AND status = 'preparing'", BackfillQueueSchema::jobs_table(), count($eligible), $job_id));
+                    });
+                    self::schedule_next_batch();
+                    $pending = count($eligible);
+                } catch (\RuntimeException $e) {
+                    self::fail_job($job_id, "Retry snapshot preparation failed. Correct the database issue and retry.");
+                    IndexState::fail("Retry snapshot preparation failed. Correct the database issue and retry.");
+                    throw $e;
+                }
+            }
+            $state = self::status();
+            if ($eligible !== [] && $pending === 0) {
+                $state["stop_reason"] = $active
+                    ? "An existing queue must finish or be cancelled before creating a retry snapshot."
+                    : "Synchronization is disabled or globally stopped.";
+            }
+            return [
+                "requested" => count($ids), "succeeded" => 0, "failed" => 0,
+                "pending" => $pending, "skipped" => count($ids) - $pending, "state" => $state,
+            ];
+        });
+    }
+
     public static function pause(): array
     {
-        $job = self::latest_job(true);
-        if (
-            is_array($job) &&
-            in_array((string) $job["status"], ["queued", "running"], true)
-        ) {
-            self::set_job_status((int) $job["id"], "paused", "paused", "");
-        }
-        return self::status();
+        return self::control("paused");
     }
 
-    /** @return array<string,mixed> */
     public static function resume(): array
     {
-        $job = self::latest_job(false);
-        if (is_array($job) && (string) $job["status"] === "paused") {
-            self::reset_stale_processing_items((int) $job["id"]);
-            self::set_job_status((int) $job["id"], "queued", "queued", "");
-            self::schedule_next_batch();
-        }
-        return self::status();
+        return self::control("queued");
     }
 
-    /** @return array<string,mixed> */
     public static function cancel(): array
     {
-        $job = self::latest_job(false);
-        if (
-            is_array($job) &&
-            in_array(
-                (string) $job["status"],
-                ["queued", "running", "paused"],
-                true,
-            )
-        ) {
-            $job_id = (int) $job["id"];
-            self::cancel_items($job_id);
-            self::set_job_status($job_id, "cancelled", "cancelled", "");
-            self::set_job_completed_at($job_id);
-            Settings::clear_initial_backfill_state(
-                "Initialization was cancelled.",
-            );
-            VectorSchema::create_vector_index();
-        }
-        return self::status();
+        return self::control("cancelled");
     }
 
-    public static function schedule_next_batch(): void
+    private static function control(string $target): array
     {
-        if (
-            function_exists("wp_next_scheduled") &&
-            !wp_next_scheduled(self::CRON_HOOK)
-        ) {
-            wp_schedule_single_event(time() + 5, self::CRON_HOOK);
-        }
+        return DatabaseLock::with("lifecycle", static function () use ($target): array {
+            global $wpdb;
+            BackfillQueueSchema::install_or_upgrade();
+            $job = self::latest_job();
+            $allowed = $target === "queued" ? ["paused"] : ["queued", "running", "paused"];
+            if ($job !== null && in_array($job["status"], $allowed, true)) {
+                if ($target === "queued" && ($job["index_generation"] !== IndexState::generation() || !IndexState::is_writable() || Settings::get("kill_switch_global") || !Settings::get("sync_enabled"))) {
+                    throw new \RuntimeException("Cannot resume: enable synchronization and initialize current settings first.");
+                }
+                $job_id = (int) $job["id"];
+                self::transition($job_id, $target, $target === "cancelled" ? "Cancelled by an administrator." : "");
+                $item_status = $target === "cancelled" ? "cancelled" : "pending";
+                Sql::query($wpdb->prepare("UPDATE %i SET status = %s, revision = revision + 1, locked_by = '', locked_at = NULL, updated_at = UTC_TIMESTAMP() WHERE job_id = %d AND status IN ('pending','processing')", BackfillQueueSchema::items_table(), $item_status, $job_id));
+                if ($target === "queued") {
+                    self::schedule_next_batch();
+                } else {
+                    self::unschedule();
+                }
+                if ($target === "cancelled") {
+                    IndexState::fail("Indexing was cancelled. Explicitly initialize or retry before resuming synchronization.");
+                }
+            }
+            return self::status();
+        });
+    }
+
+    /** Called with the lifecycle lock by IndexState; never runs destructive DDL. */
+    public static function stop_for_invalidation(string $reason): void
+    {
+        global $wpdb;
+        BackfillQueueSchema::install_or_upgrade();
+        Sql::query($wpdb->prepare("UPDATE %i SET status = 'cancelled', phase = 'cancelled', last_error = %s, updated_at = UTC_TIMESTAMP(), completed_at = UTC_TIMESTAMP() WHERE status IN ('preparing','queued','running','paused')", BackfillQueueSchema::jobs_table(), $reason));
+        Sql::query($wpdb->prepare("UPDATE %i SET status = 'cancelled', revision = revision + 1, locked_by = '', locked_at = NULL WHERE status IN ('pending','processing')", BackfillQueueSchema::items_table()));
+        self::unschedule();
     }
 
     public static function clear_queue(): void
     {
-        self::unschedule();
-        delete_option(self::OPTION_KEY);
-        self::clear_queue_rows();
-        VectorSchema::create_vector_index();
+        DatabaseLock::with("lifecycle", static function (): void {
+            global $wpdb;
+            self::stop_for_invalidation("Queue cleared.");
+            Sql::transaction(static function () use ($wpdb): void {
+                Sql::query($wpdb->prepare("DELETE FROM %i", BackfillQueueSchema::items_table()));
+                Sql::query($wpdb->prepare("DELETE FROM %i", BackfillQueueSchema::jobs_table()));
+            });
+            delete_option(self::OPTION_KEY);
+        });
+    }
+
+    public static function schedule_next_batch(): void
+    {
+        if (!wp_next_scheduled(self::CRON_HOOK)) {
+            $result = wp_schedule_event(time() + 5, "ritriever_minute", self::CRON_HOOK, [], true);
+            if (is_wp_error($result) || $result === false) {
+                throw new \RuntimeException("Unable to schedule the queue watchdog; configure WP-Cron or use WP-CLI.");
+            }
+        }
     }
 
     public static function unschedule(): void
     {
-        if (!function_exists("wp_next_scheduled")) {
+        wp_clear_scheduled_hook(self::CRON_HOOK);
+    }
+
+    public static function assert_claim(int $job_id, string $token, int $post_id): void
+    {
+        global $wpdb;
+        $count = Sql::value($wpdb->prepare(
+            "SELECT COUNT(*) FROM %i i INNER JOIN %i j ON j.id = i.job_id WHERE i.job_id = %d AND i.post_id = %d AND i.status = 'processing' AND i.locked_by = %s AND i.revision = i.claimed_revision AND j.status IN ('queued','running') AND j.index_generation = %s",
+            BackfillQueueSchema::items_table(), BackfillQueueSchema::jobs_table(), $job_id, $post_id, $token, IndexState::generation(),
+        ));
+        if ((int) $count !== 1) {
+            throw new StaleIndexWork("Queue claim was superseded, paused, or cancelled.");
+        }
+    }
+
+    private static function complete_item(int $job_id, string $token, int $post_id): void
+    {
+        global $wpdb;
+        PostSync::refresh_post($post_id);
+        if (PostFilter::is_eligible($post_id) && !(new LocalVectorRepository())->has_current($post_id, PostSync::content_hash($post_id), IndexState::generation())) {
+            self::retry_item($job_id, $token, $post_id, new StaleIndexWork("Current post has no matching durable index receipt."), true);
             return;
         }
-        $timestamp = wp_next_scheduled(self::CRON_HOOK);
-        while ($timestamp) {
-            wp_unschedule_event($timestamp, self::CRON_HOOK);
-            $timestamp = wp_next_scheduled(self::CRON_HOOK);
+        Sql::query($wpdb->prepare("UPDATE %i SET status = 'done', locked_by = '', locked_at = NULL, last_error = '', updated_at = UTC_TIMESTAMP() WHERE job_id = %d AND post_id = %d AND locked_by = %s AND status = 'processing' AND revision = claimed_revision", BackfillQueueSchema::items_table(), $job_id, $post_id, $token));
+        delete_post_meta($post_id, RITRIEVER_POSTMETA_LAST_ERROR);
+    }
+
+    private static function retry_item(int $job_id, string $token, int $post_id, \Throwable $error, bool $stale = false): void
+    {
+        global $wpdb;
+        $attempts = (int) Sql::value($wpdb->prepare("SELECT attempts FROM %i WHERE job_id = %d AND post_id = %d AND locked_by = %s", BackfillQueueSchema::items_table(), $job_id, $post_id, $token));
+        $retryable = $stale || self::is_retryable($error);
+        $pending = $retryable && ($stale || $attempts < self::MAX_ATTEMPTS);
+        $delay = $stale ? 5 : min(3600, 30 * (2 ** max(0, $attempts - 1)));
+        if (method_exists($error, "retry_after")) {
+            $delay = max($delay, min(86400, (int) $error->retry_after()));
+        } elseif ($error instanceof \RiTriever\Embedding\EmbeddingProviderException) {
+            $delay = max($delay, min(86400, $error->retry_after));
+        }
+        $message = $stale ? "Post changed; retrying its current revision." : self::safe_error($error, $pending);
+        Sql::query($wpdb->prepare("UPDATE %i SET status = %s, locked_by = '', locked_at = NULL, available_at = %s, last_error = %s, updated_at = UTC_TIMESTAMP() WHERE job_id = %d AND post_id = %d AND locked_by = %s AND status = 'processing' AND revision = claimed_revision", BackfillQueueSchema::items_table(), $pending ? "pending" : "failed", gmdate("Y-m-d H:i:s", time() + $delay), $message, $job_id, $post_id, $token));
+        Sql::query($wpdb->prepare("UPDATE %i SET last_error = %s, phase = %s, updated_at = UTC_TIMESTAMP() WHERE id = %d AND status IN ('queued','running')", BackfillQueueSchema::jobs_table(), $message, $pending ? "backoff" : "embedding", $job_id));
+        if (!$stale) {
+            update_post_meta($post_id, RITRIEVER_POSTMETA_LAST_ERROR, $message);
         }
     }
 
-    /** @return int[] */
-    private static function eligible_post_ids(): array
+    public static function is_retryable(\Throwable $error): bool
     {
-        $post_types = Settings::get("post_types");
-        $post_statuses = Settings::get("post_statuses");
-        $query = new \WP_Query([
-            "post_type" =>
-                is_array($post_types) && $post_types !== []
-                    ? $post_types
-                    : "any",
-            "post_status" =>
-                is_array($post_statuses) && $post_statuses !== []
-                    ? $post_statuses
-                    : ["publish"],
-            "posts_per_page" => -1,
-            "fields" => "ids",
-            "orderby" => "ID",
-            "order" => "ASC",
-            "ignore_sticky_posts" => true,
-            "no_found_rows" => true,
-            "update_post_meta_cache" => false,
-            "update_post_term_cache" => false,
-        ]);
-        $ids = array_map(
-            "intval",
-            is_array($query->posts) ? $query->posts : [],
-        );
-        wp_reset_postdata();
-        return array_values(
-            array_filter(
-                $ids,
-                static fn(int $post_id): bool => PostFilter::is_eligible(
-                    $post_id,
-                ),
-            ),
-        );
-    }
-
-    /** @param int[] $ids */
-    private static function insert_queue_items(
-        int $job_id,
-        array $ids,
-        string $now,
-    ): void {
-        if ($ids === []) {
-            return;
+        if (!($error instanceof \RuntimeException)) {
+            return false;
         }
-
-        global $wpdb;
-        $items = BackfillQueueSchema::items_table();
-        foreach (array_chunk($ids, 500) as $batch) {
-            foreach ($batch as $post_id) {
-                $ok = $wpdb->insert(
-                    $items,
-                    [
-                        "job_id" => $job_id,
-                        "post_id" => (int) $post_id,
-                        "status" => "pending",
-                        "attempts" => 0,
-                        "locked_by" => "",
-                        "created_at" => $now,
-                        "updated_at" => $now,
-                    ],
-                    ["%d", "%d", "%s", "%d", "%s", "%s", "%s"],
-                );
-                if ($ok === false) {
-                    throw new \RuntimeException(
-                        "Failed to create backfill queue items: " .
-                            esc_html($wpdb->last_error),
-                    );
-                }
-            }
+        if ($error instanceof \RiTriever\Embedding\EmbeddingProviderException) {
+            return $error->retryable;
         }
-    }
-
-    /** @return array<string,mixed>|null */
-    private static function latest_job(bool $active_only): ?array
-    {
-        global $wpdb;
-        $jobs = BackfillQueueSchema::jobs_table();
-        // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
-        $job = $active_only
-            ? $wpdb->get_row(
-                $wpdb->prepare(
-                    "SELECT * FROM %i WHERE status IN ('queued', 'running', 'paused') ORDER BY id DESC LIMIT 1",
-                    $jobs,
-                ),
-                ARRAY_A,
-            )
-            : $wpdb->get_row(
-                $wpdb->prepare(
-                    "SELECT * FROM %i ORDER BY id DESC LIMIT 1",
-                    $jobs,
-                ),
-                ARRAY_A,
-            );
-        return is_array($job) ? $job : null;
-    }
-
-    /** @param array<string,mixed> $job @return array<string,mixed> */
-    private static function job_state(array $job): array
-    {
-        global $wpdb;
-        $items = BackfillQueueSchema::items_table();
-        $job_id = (int) $job["id"];
-        // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
-        $rows = $wpdb->get_results(
-            $wpdb->prepare(
-                "SELECT status, COUNT(*) AS count FROM %i WHERE job_id = %d GROUP BY status",
-                $items,
-                $job_id,
-            ),
-            ARRAY_A,
-        );
-        $counts = [];
-        foreach (is_array($rows) ? $rows : [] as $row) {
-            $counts[(string) $row["status"]] = (int) $row["count"];
+        if (method_exists($error, "is_retryable")) {
+            return (bool) $error->is_retryable();
         }
-
-        $total = (int) ($job["total_posts"] ?? 0);
-        $processed =
-            ($counts["done"] ?? 0) +
-            ($counts["failed"] ?? 0) +
-            ($counts["skipped"] ?? 0) +
-            ($counts["cancelled"] ?? 0);
-        $errors = $counts["failed"] ?? 0;
-        // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
-        $failed_ids = $wpdb->get_col(
-            $wpdb->prepare(
-                "SELECT post_id FROM %i WHERE job_id = %d AND status = 'failed' ORDER BY id ASC LIMIT 200",
-                $items,
-                $job_id,
-            ),
-        );
-
-        return [
-            "job_id" => $job_id,
-            "status" => (string) ($job["status"] ?? "idle"),
-            "phase" => (string) ($job["phase"] ?? ""),
-            "ids" => [],
-            "total" => $total,
-            "processed" => min($total, max(0, $processed)),
-            "errors" => max(0, $errors),
-            "failed_ids" => array_values(
-                array_map("intval", is_array($failed_ids) ? $failed_ids : []),
-            ),
-            "created_at" => self::db_datetime_to_timestamp(
-                (string) ($job["created_at"] ?? ""),
-            ),
-            "updated_at" => self::db_datetime_to_timestamp(
-                (string) ($job["updated_at"] ?? ""),
-            ),
-            "completed_at" => self::db_datetime_to_timestamp(
-                (string) ($job["completed_at"] ?? ""),
-            ),
-            "last_error" => (string) ($job["last_error"] ?? ""),
-            "counts" => $counts,
-        ];
+        $message = strtolower($error->getMessage());
+        return $error instanceof StaleIndexWork || in_array((int) $error->getCode(), [408, 425, 429, 500, 502, 503, 504, 1205, 1213, 2006, 2013], true) ||
+            preg_match('/429|503|502|504|500|timeout|timed out|connection|database|rate limit|temporar/i', $message) === 1;
     }
 
-    /** @return array<string,mixed> */
-    private static function idle_state(): array
+    private static function safe_error(\Throwable $error, bool $pending): string
     {
-        return [
-            "job_id" => 0,
-            "status" => "idle",
-            "phase" => "idle",
-            "ids" => [],
-            "total" => 0,
-            "processed" => 0,
-            "errors" => 0,
-            "failed_ids" => [],
-            "created_at" => 0,
-            "updated_at" => 0,
-            "completed_at" => 0,
-            "last_error" => "",
-            "counts" => [],
-        ];
+        $code = (int) $error->getCode();
+        return ($pending ? "Temporary indexing failure; scheduled retry." : "Indexing failed or retry limit reached; retry after correcting the provider/database settings.") . ($code > 0 ? " Code: " . $code . "." : "");
     }
 
-    private static function claim_items(
-        int $job_id,
-        string $token,
-        int $limit,
-    ): int {
-        global $wpdb;
-        $items = BackfillQueueSchema::items_table();
-        // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
-        $claimed = $wpdb->query(
-            $wpdb->prepare(
-                "UPDATE %i SET status = 'processing', locked_by = %s, locked_at = UTC_TIMESTAMP(), attempts = attempts + 1, updated_at = UTC_TIMESTAMP() WHERE job_id = %d AND status = 'pending' ORDER BY id ASC LIMIT %d",
-                $items,
-                $token,
-                $job_id,
-                $limit,
-            ),
-        );
-        return max(0, (int) $claimed);
-    }
-
-    /** @return int[] */
-    private static function claimed_post_ids(int $job_id, string $token): array
-    {
-        global $wpdb;
-        $items = BackfillQueueSchema::items_table();
-        // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
-        $ids = $wpdb->get_col(
-            $wpdb->prepare(
-                "SELECT post_id FROM %i WHERE job_id = %d AND locked_by = %s AND status = 'processing' ORDER BY id ASC",
-                $items,
-                $job_id,
-                $token,
-            ),
-        );
-        return array_values(array_map("intval", is_array($ids) ? $ids : []));
-    }
-
-    /** @param int[] $post_ids */
-    private static function mark_claimed_items(
-        int $job_id,
-        string $token,
-        array $post_ids,
-        string $status,
-    ): void {
-        if ($post_ids === []) {
-            return;
-        }
-
-        global $wpdb;
-        $items = BackfillQueueSchema::items_table();
-        $post_ids = array_values(array_map("intval", $post_ids));
-        foreach ($post_ids as $post_id) {
-            // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
-            $wpdb->query(
-                $wpdb->prepare(
-                    "UPDATE %i SET status = %s, locked_by = '', locked_at = NULL, updated_at = UTC_TIMESTAMP() WHERE job_id = %d AND locked_by = %s AND post_id = %d",
-                    $items,
-                    $status,
-                    $job_id,
-                    $token,
-                    $post_id,
-                ),
-            );
-        }
-    }
-
-    private static function release_claimed_items(
-        int $job_id,
-        string $token,
-        string $error,
-    ): void {
-        global $wpdb;
-        $items = BackfillQueueSchema::items_table();
-        // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
-        $wpdb->query(
-            $wpdb->prepare(
-                "UPDATE %i SET status = 'pending', locked_by = '', locked_at = NULL, last_error = %s, updated_at = UTC_TIMESTAMP() WHERE job_id = %d AND locked_by = %s",
-                $items,
-                $error,
-                $job_id,
-                $token,
-            ),
-        );
-    }
-
-    private static function reset_stale_processing_items(int $job_id): void
-    {
-        global $wpdb;
-        $items = BackfillQueueSchema::items_table();
-        // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
-        $wpdb->query(
-            $wpdb->prepare(
-                "UPDATE %i SET status = 'pending', locked_by = '', locked_at = NULL, updated_at = UTC_TIMESTAMP() WHERE job_id = %d AND status = 'processing' AND locked_at < DATE_SUB(UTC_TIMESTAMP(), INTERVAL %d MINUTE)",
-                $items,
-                $job_id,
-                self::STALE_LOCK_MINUTES,
-            ),
-        );
-    }
-
-    private static function reset_processing_items(int $job_id): void
-    {
-        global $wpdb;
-        $items = BackfillQueueSchema::items_table();
-        // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
-        $wpdb->query(
-            $wpdb->prepare(
-                "UPDATE %i SET status = 'pending', locked_by = '', locked_at = NULL, updated_at = UTC_TIMESTAMP() WHERE job_id = %d AND status = 'processing'",
-                $items,
-                $job_id,
-            ),
-        );
-    }
-
-    private static function cancel_items(int $job_id): void
-    {
-        global $wpdb;
-        $items = BackfillQueueSchema::items_table();
-        // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
-        $wpdb->query(
-            $wpdb->prepare(
-                "UPDATE %i SET status = 'cancelled', locked_by = '', locked_at = NULL, updated_at = UTC_TIMESTAMP() WHERE job_id = %d AND status IN ('pending', 'processing')",
-                $items,
-                $job_id,
-            ),
-        );
-    }
-
-    /** @return array<string,mixed> */
     private static function finish_or_continue(int $job_id): array
     {
         global $wpdb;
-        $jobs = BackfillQueueSchema::jobs_table();
-        $items = BackfillQueueSchema::items_table();
-
-        // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
-        $job = $wpdb->get_row(
-            $wpdb->prepare("SELECT * FROM %i WHERE id = %d", $jobs, $job_id),
-            ARRAY_A,
-        );
-        if (!is_array($job)) {
+        $job = self::job_by_id($job_id);
+        if ($job === null) {
             return self::idle_state();
         }
-        $current_status = (string) $job["status"];
-        if ($current_status === "paused" || $current_status === "cancelled") {
-            return self::job_state($job);
+        $state = self::job_state($job);
+        if (!in_array($job["status"], ["queued", "running"], true)) {
+            return $state;
         }
-
-        // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
-        $pending = (int) $wpdb->get_var(
-            $wpdb->prepare(
-                "SELECT COUNT(*) FROM %i WHERE job_id = %d AND status = 'pending'",
-                $items,
-                $job_id,
-            ),
-        );
-        // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
-        $processing = (int) $wpdb->get_var(
-            $wpdb->prepare(
-                "SELECT COUNT(*) FROM %i WHERE job_id = %d AND status = 'processing'",
-                $items,
-                $job_id,
-            ),
-        );
-        // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
-        $failed = (int) $wpdb->get_var(
-            $wpdb->prepare(
-                "SELECT COUNT(*) FROM %i WHERE job_id = %d AND status = 'failed'",
-                $items,
-                $job_id,
-            ),
-        );
-        $processed = (int) $wpdb->get_var(
-            $wpdb->prepare(
-                "SELECT COUNT(*) FROM %i WHERE job_id = %d AND status IN ('done', 'failed', 'skipped', 'cancelled')",
-                $items,
-                $job_id,
-            ),
-        );
-
-        if ($pending === 0 && $processing === 0) {
-            self::set_job_status($job_id, "running", "building_index", "");
-            VectorSchema::create_vector_index();
-            $final_status = $failed === 0 ? "complete" : "failed";
-            self::set_job_status($job_id, $final_status, $final_status, "");
-            self::set_job_completed_at($job_id);
-            if ($failed === 0) {
-                Settings::mark_initial_backfill_complete([
-                    "processed" => $processed,
-                    "errors" => 0,
-                    "completed_at" => time(),
-                ]);
-            } else {
-                Settings::clear_initial_backfill_state(
-                    "Initialization completed with indexing errors.",
-                );
-            }
-        } elseif ($processing > 0) {
-            self::set_job_status($job_id, "running", "embedding", "");
-        } else {
-            self::set_job_status($job_id, "queued", "queued", "");
+        if ($job["index_generation"] !== IndexState::generation()) {
+            self::transition($job_id, "cancelled", "Index generation changed.");
+            return self::status();
+        }
+        $counts = $state["counts"];
+        if (array_sum($counts) !== (int) $job["total_posts"]) {
+            self::fail_job($job_id, "Queue item count mismatch; explicitly initialize again.");
+            IndexState::fail("Queue item count mismatch; explicitly initialize again.");
+            self::unschedule();
+            return self::status();
+        }
+        if (($counts["pending"] ?? 0) + ($counts["processing"] ?? 0) > 0) {
             self::schedule_next_batch();
+            return $state;
         }
-
-        $updated_job = self::job_by_id($job_id);
-        return is_array($updated_job)
-            ? self::job_state($updated_job)
-            : self::idle_state();
+        if (($counts["failed"] ?? 0) + ($counts["cancelled"] ?? 0) > 0) {
+            foreach (Sql::rows($wpdb->prepare("SELECT post_id FROM %i WHERE job_id = %d AND status = 'failed'", BackfillQueueSchema::items_table(), $job_id)) as $row) {
+                if (get_post_meta((int) $row["post_id"], RITRIEVER_POSTMETA_LAST_ERROR, true) === "") {
+                    update_post_meta((int) $row["post_id"], RITRIEVER_POSTMETA_LAST_ERROR, "Indexing failed or its worker exhausted the retry limit.");
+                }
+            }
+            self::fail_job($job_id, "Indexing failed; correct the cause and retry failed posts.");
+            IndexState::fail("Indexing failed; correct the cause and retry failed posts.");
+            self::unschedule();
+            return self::status();
+        }
+        try {
+            $repository = new LocalVectorRepository();
+            $ids = array_map("intval", array_column(Sql::rows($wpdb->prepare("SELECT post_id FROM %i WHERE job_id = %d AND status = 'done'", BackfillQueueSchema::items_table(), $job_id)), "post_id"));
+            foreach ($ids as $post_id) {
+                PostSync::refresh_post($post_id);
+                if (PostFilter::is_eligible($post_id) && !$repository->has_current($post_id, PostSync::content_hash($post_id), (string) $job["index_generation"])) {
+                    self::put_item($job_id, $post_id);
+                }
+            }
+            if ((int) Sql::value($wpdb->prepare("SELECT COUNT(*) FROM %i WHERE job_id = %d AND status = 'pending'", BackfillQueueSchema::items_table(), $job_id)) > 0) {
+                self::schedule_next_batch();
+                return self::status();
+            }
+            VectorSchema::create_vector_index();
+            $missing = [];
+            foreach (self::eligible_post_ids() as $post_id) {
+                PostSync::refresh_post($post_id);
+                if (!$repository->has_current($post_id, PostSync::content_hash($post_id), (string) $job["index_generation"])) {
+                    $missing[] = $post_id;
+                    update_post_meta($post_id, RITRIEVER_POSTMETA_LAST_ERROR, "Current-generation index data is missing. Explicitly retry this post or initialize.");
+                }
+            }
+            if ($missing !== []) {
+                throw new \RuntimeException("Current-generation coverage is incomplete; retry missing posts or initialize.");
+            }
+            $remaining_failures = self::remaining_failures();
+            $completion_reason = $remaining_failures > 0 ? "Retry snapshot completed; other eligible posts still have indexing failures." : "";
+            if ($remaining_failures > 0) {
+                IndexState::fail($completion_reason);
+            } else {
+                IndexState::mark_ready((string) $job["index_generation"]);
+            }
+            self::transition($job_id, "complete", $completion_reason);
+            Sql::query($wpdb->prepare("UPDATE %i SET completed_at = UTC_TIMESTAMP() WHERE id = %d AND status = 'complete'", BackfillQueueSchema::jobs_table(), $job_id));
+            if ($remaining_failures === 0) {
+                Settings::mark_initial_backfill_complete(["processed" => count($ids), "errors" => 0, "completed_at" => time()]);
+            }
+            self::unschedule();
+            SearchInterceptor::purge_query_cache();
+        } catch (\RuntimeException $e) {
+            self::fail_job($job_id, "Index/schema verification failed; explicitly retry initialization.");
+            IndexState::fail("Index/schema verification failed; explicitly retry initialization.");
+            self::unschedule();
+            throw $e;
+        }
+        return self::status();
     }
 
-    /** @return array<string,mixed>|null */
+    private static function new_job(string $generation, string $kind): int
+    {
+        global $wpdb;
+        Sql::query($wpdb->prepare("INSERT INTO %i (status, phase, kind, index_generation, total_posts, created_at, updated_at, last_error) VALUES ('preparing', 'preparing', %s, %s, 0, UTC_TIMESTAMP(), UTC_TIMESTAMP(), '')", BackfillQueueSchema::jobs_table(), $kind, $generation));
+        return (int) Sql::value("SELECT LAST_INSERT_ID()");
+    }
+
+    private static function put_item(int $job_id, int $post_id): void
+    {
+        global $wpdb;
+        Sql::query($wpdb->prepare("INSERT INTO %i (job_id, post_id, status, attempts, revision, claimed_revision, available_at, locked_by, created_at, updated_at) VALUES (%d, %d, 'pending', 0, 1, 0, UTC_TIMESTAMP(), '', UTC_TIMESTAMP(), UTC_TIMESTAMP()) ON DUPLICATE KEY UPDATE status = 'pending', attempts = 0, revision = revision + 1, available_at = UTC_TIMESTAMP(), locked_by = '', locked_at = NULL, last_error = '', updated_at = UTC_TIMESTAMP()", BackfillQueueSchema::items_table(), $job_id, $post_id));
+    }
+
+    private static function item_count(int $job_id): int
+    {
+        global $wpdb;
+        return (int) Sql::value($wpdb->prepare("SELECT COUNT(*) FROM %i WHERE job_id = %d", BackfillQueueSchema::items_table(), $job_id));
+    }
+
+    private static function transition(int $job_id, string $status, string $error): void
+    {
+        global $wpdb;
+        // All callers hold lifecycle; SQL status conditions also fence old workers.
+        $allowed = $status === "queued" ? ["preparing", "paused", "failed", "complete", "queued", "running"] : ["preparing", "queued", "running", "paused"];
+        $job = self::job_by_id($job_id);
+        if ($job === null || !in_array($job["status"], $allowed, true)) {
+            return;
+        }
+        Sql::query($wpdb->prepare("UPDATE %i SET status = %s, phase = %s, last_error = %s, updated_at = UTC_TIMESTAMP(), completed_at = NULL WHERE id = %d AND status = %s", BackfillQueueSchema::jobs_table(), $status, $status, $error, $job_id, $job["status"]));
+    }
+
+    private static function fail_job(int $job_id, string $error): void
+    {
+        self::transition($job_id, "failed", $error);
+    }
+
+    private static function latest_job(): ?array
+    {
+        global $wpdb;
+        $rows = Sql::rows($wpdb->prepare("SELECT * FROM %i ORDER BY id DESC LIMIT 1", BackfillQueueSchema::jobs_table()));
+        return $rows[0] ?? null;
+    }
+
     private static function job_by_id(int $job_id): ?array
     {
         global $wpdb;
-        $jobs = BackfillQueueSchema::jobs_table();
-        // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
-        $job = $wpdb->get_row(
-            $wpdb->prepare("SELECT * FROM %i WHERE id = %d", $jobs, $job_id),
-            ARRAY_A,
-        );
-        return is_array($job) ? $job : null;
+        $rows = Sql::rows($wpdb->prepare("SELECT * FROM %i WHERE id = %d", BackfillQueueSchema::jobs_table(), $job_id));
+        return $rows[0] ?? null;
     }
 
-    private static function set_job_status(
-        int $job_id,
-        string $status,
-        string $phase,
-        string $error,
-    ): void {
-        global $wpdb;
-        $jobs = BackfillQueueSchema::jobs_table();
-        // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
-        $wpdb->query(
-            $wpdb->prepare(
-                "UPDATE %i SET status = %s, phase = %s, last_error = %s, updated_at = UTC_TIMESTAMP() WHERE id = %d",
-                $jobs,
-                $status,
-                $phase,
-                $error,
-                $job_id,
-            ),
-        );
-    }
-
-    private static function set_job_error(int $job_id, string $error): void
+    private static function job_state(array $job): array
     {
         global $wpdb;
-        $jobs = BackfillQueueSchema::jobs_table();
-        // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
-        $wpdb->query(
-            $wpdb->prepare(
-                "UPDATE %i SET last_error = %s, updated_at = UTC_TIMESTAMP() WHERE id = %d",
-                $jobs,
-                $error,
-                $job_id,
-            ),
-        );
-    }
-
-    private static function set_job_completed_at(int $job_id): void
-    {
-        global $wpdb;
-        $jobs = BackfillQueueSchema::jobs_table();
-        // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
-        $wpdb->query(
-            $wpdb->prepare(
-                "UPDATE %i SET completed_at = UTC_TIMESTAMP(), updated_at = UTC_TIMESTAMP() WHERE id = %d",
-                $jobs,
-                $job_id,
-            ),
-        );
-    }
-
-    private static function clear_queue_rows(): void
-    {
-        BackfillQueueSchema::install_or_upgrade();
-        global $wpdb;
-        $items = BackfillQueueSchema::items_table();
-        $jobs = BackfillQueueSchema::jobs_table();
-        // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
-        $wpdb->query($wpdb->prepare("DELETE FROM %i", $items));
-        // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
-        $wpdb->query($wpdb->prepare("DELETE FROM %i", $jobs));
-        delete_option(self::OPTION_KEY);
-    }
-
-    private static function acquire_process_lock(string $token): bool
-    {
-        $payload = [
-            "token" => $token,
-            "expires" => time() + self::PROCESS_LOCK_TTL_SECONDS,
+        $id = (int) $job["id"];
+        $counts = [];
+        foreach (Sql::rows($wpdb->prepare("SELECT status, COUNT(*) AS count FROM %i WHERE job_id = %d GROUP BY status", BackfillQueueSchema::items_table(), $id)) as $row) {
+            $counts[(string) $row["status"]] = (int) $row["count"];
+        }
+        $failed_ids = array_map("intval", array_column(Sql::rows($wpdb->prepare("SELECT post_id FROM %i WHERE job_id = %d AND status = 'failed' ORDER BY id LIMIT 200", BackfillQueueSchema::items_table(), $id)), "post_id"));
+        $timing = Sql::rows($wpdb->prepare("SELECT MAX(attempts) AS attempts, MIN(CASE WHEN status = 'pending' THEN available_at END) AS next_attempt FROM %i WHERE job_id = %d", BackfillQueueSchema::items_table(), $id));
+        $remaining_failures = self::remaining_failures();
+        if ((string) ($job["index_generation"] ?? "") !== IndexState::generation()) {
+            $job["status"] = "cancelled";
+            $job["phase"] = "superseded";
+            $job["last_error"] = "This job belongs to an obsolete generation; explicitly initialize the current settings.";
+        } elseif ($job["status"] === "complete" && !IndexState::is_ready()) {
+            if (($job["kind"] ?? "") === "retry" && $remaining_failures > 0) {
+                $job["phase"] = "complete_with_remaining_failures";
+                $job["last_error"] = "Retry snapshot completed; other eligible posts still have indexing failures.";
+            } else {
+                $job["status"] = "failed";
+                $job["phase"] = "verification";
+                $job["last_error"] = "Index generation/schema is not ready; explicitly initialize or retry.";
+            }
+        }
+        return [
+            "job_id" => $id, "status" => (string) $job["status"], "phase" => (string) $job["phase"], "ids" => [],
+            "total" => (int) $job["total_posts"],
+            "processed" => ($counts["done"] ?? 0) + ($counts["failed"] ?? 0) + ($counts["cancelled"] ?? 0),
+            "errors" => $counts["failed"] ?? 0, "failed_ids" => $failed_ids, "counts" => $counts,
+            "created_at" => self::timestamp($job["created_at"] ?? ""), "updated_at" => self::timestamp($job["updated_at"] ?? ""),
+            "completed_at" => self::timestamp($job["completed_at"] ?? ""),
+            "last_error" => (string) ($job["last_error"] ?? ""), "stop_reason" => (string) ($job["last_error"] ?? ""),
+            "attempts" => (int) ($timing[0]["attempts"] ?? 0), "next_attempt" => self::timestamp($timing[0]["next_attempt"] ?? ""),
+            "next_scheduled" => (int) wp_next_scheduled(self::CRON_HOOK),
+            "remaining" => ($counts["pending"] ?? 0) + ($counts["processing"] ?? 0),
+            "remaining_failures" => $remaining_failures,
+            "next_run_at" => in_array($job["status"], ["queued", "running"], true)
+                ? max((int) wp_next_scheduled(self::CRON_HOOK), self::timestamp($timing[0]["next_attempt"] ?? "")) : 0,
+            "generation" => (string) ($job["index_generation"] ?? ""),
         ];
-        if (add_option(self::PROCESS_LOCK_OPTION, $payload, "", "no")) {
-            return true;
-        }
-
-        $lock = get_option(self::PROCESS_LOCK_OPTION, []);
-        $expires = is_array($lock) ? (int) ($lock["expires"] ?? 0) : 0;
-        if ($expires > 0 && $expires < time()) {
-            delete_option(self::PROCESS_LOCK_OPTION);
-            return add_option(self::PROCESS_LOCK_OPTION, $payload, "", "no");
-        }
-
-        return false;
     }
 
-    private static function release_process_lock(string $token): void
+    private static function idle_state(): array
     {
-        $lock = get_option(self::PROCESS_LOCK_OPTION, []);
-        if (is_array($lock) && (string) ($lock["token"] ?? "") === $token) {
-            delete_option(self::PROCESS_LOCK_OPTION);
-        }
+        return ["job_id" => 0, "status" => "idle", "phase" => "idle", "ids" => [], "total" => 0, "processed" => 0, "errors" => 0, "failed_ids" => [], "created_at" => 0, "updated_at" => 0, "completed_at" => 0, "last_error" => "", "stop_reason" => "", "counts" => [], "attempts" => 0, "next_attempt" => 0, "next_scheduled" => 0, "remaining" => 0, "remaining_failures" => 0, "next_run_at" => 0, "generation" => ""];
     }
 
-    private static function worker_token(): string
+    private static function remaining_failures(): int
     {
-        try {
-            return bin2hex(random_bytes(16));
-        } catch (\Throwable $e) {
-            return uniqid("ritriever-", true);
-        }
+        global $wpdb;
+        $rows = Sql::rows($wpdb->prepare("SELECT DISTINCT post_id FROM %i WHERE meta_key = %s AND meta_value <> ''", $wpdb->postmeta, RITRIEVER_POSTMETA_LAST_ERROR));
+        return count(array_filter(array_map("intval", array_column($rows, "post_id")), static fn(int $id): bool => PostFilter::is_eligible($id)));
     }
 
-    private static function db_datetime_to_timestamp(string $datetime): int
+    private static function normalize_ids(array $ids): array
     {
-        if ($datetime === "" || $datetime === "0000-00-00 00:00:00") {
-            return 0;
+        return array_values(array_unique(array_filter(array_map("intval", $ids), static fn(int $id): bool => $id > 0)));
+    }
+
+    public static function eligible_post_ids(): array
+    {
+        global $wpdb;
+        $types = array_values((array) Settings::get("post_types"));
+        $statuses = array_values((array) Settings::get("post_statuses"));
+        if ($types === [] || $statuses === []) {
+            return [];
         }
-        $timestamp = strtotime($datetime . " UTC");
-        return $timestamp === false ? 0 : (int) $timestamp;
+        $type_slots = implode(",", array_fill(0, count($types), "%s"));
+        $status_slots = implode(",", array_fill(0, count($statuses), "%s"));
+        $sql = "SELECT ID FROM %i WHERE post_type IN (" . $type_slots . ") AND post_status IN (" . $status_slots . ") AND post_password = '' ORDER BY ID";
+        // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared -- Variable fragments contain only generated %s placeholders.
+        $rows = Sql::rows($wpdb->prepare($sql, $wpdb->posts, ...array_merge($types, $statuses)));
+        return array_values(array_filter(self::normalize_ids(array_column($rows, "ID")), static fn(int $id): bool => PostFilter::is_eligible($id)));
+    }
+
+    private static function timestamp($value): int
+    {
+        return is_string($value) && $value !== "" ? (int) strtotime($value . " UTC") : 0;
     }
 }

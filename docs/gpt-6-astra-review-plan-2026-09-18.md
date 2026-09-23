@@ -276,7 +276,7 @@ fingerprint は単一の共通生成処理を通常同期・bulk・検索・pref
 | Cache / Site | DB transient、永続 object cache、並行 purge、uninstall、単一サイト、multisite の switch / restore |
 | Provider / UI | 各 provider の request fixture、index 順序・次元・不正応答、設定の round-trip、翻訳一覧障害、遅延 AJAX 応答 |
 
-既存の `make wordpress-compat-*`、Plugin Check、構文・PHPCS・i18n・package の gate は残す。新しいテストは実投稿・API キーを必要としない fixture を基本とし、実 provider の確認が必要な場合だけ明示的に opt-in する。全 stack は専用 project / volume / port を用い、既存環境に対する reset や uninstall を実行しない。
+既存の `make wordpress-compat-*`、Plugin Check、構文・PHPCS・i18n・package の gate は残す。新しいテストは実投稿・API キーを必要としない fixture を基本とし、実 provider の確認が必要な場合だけ明示的に opt-in する。全 stack は専用 container / network / volume / port を用い、既存環境に対する reset や uninstall を実行しない。
 
 ## 6. 移行・ロールバック
 
@@ -327,3 +327,62 @@ fingerprint は単一の共通生成処理を通常同期・bulk・検索・pref
 | 今回の変更範囲 | この計画書のみを commit / push の対象とし、製品コード・schema・設定・配布 ZIP は変更しない |
 
 実装時に第7節の判断が確定した場合や実 DB 試験で前提が変わった場合は、受入条件・移行手順を更新して再レビューする。既知の P1 を残したまま、静的チェックの成功のみを理由にリリースしない。
+
+## 9. 実装結果（2026-09-18）
+
+第1〜8節はレビュー・計画作成時点の記録。本節はその後の実装結果であり、「今回の変更は計画書のみ」という当初の範囲とは区別する。
+
+**R01〜R15 の修正を実装した。** 未公開の作業ツリー上の変更であり、WordPress.org への公開や実サイトの移行は実施していない。
+
+| 対象 | 実装 |
+| --- | --- |
+| R01 / R02 / R05 | `IndexState` による共通 fingerprint / 世代と `ritriever_indexed_posts` の保存記録。チャンク・記録・成功メタを同一トランザクションで更新し、投稿内容・適格性・claim を commit 前に再確認 |
+| R03 / R06 / R07 / R12 | Unicode 境界を維持するチャンク、編集値を保持するプリセット、共有 `EmbeddingResponseValidator`、安全な構造化 API エラー、安定した locale context と言語選択の保持 |
+| R04 / R10 / R11 / R13 | 同期変更の queue 集約、60秒間隔の watchdog、claim 回収・backoff・上限、条件付き状態遷移、schema 検証、独立した retry snapshot、古い AJAX 応答の排除 |
+| R08 / R14 | 元 query context と包含・除外条件を保持。未対応構文・hook・障害は native 検索へ復帰。非装飾タイトルはそのまま、装飾対象のみ escape |
+| R09 / R15 | 世代付き cache と lock 下の bounded registry、live 結果の保存と purge の直列化、uninstall 清掃、サイト別設定 cache、network activation / 新規サイト初期化 |
+
+保存整合性のため、WordPress ソーステーブルも InnoDB を要求する。critical section では `$wpdb` が利用する接続を固定し、接続断でトランザクション文が autocommit として再送されることを防ぐ。SQL は呼出し側で prepare し、限定的な native mysqli 呼出しの理由と静的検査上の例外を該当箇所に記載した。一般的な DB アクセスの検査を無効化していない。
+
+### 実行した確認
+
+| 確認 | 結果 |
+| --- | --- |
+| `make test` | 成功。索引149 assertions、provider / settings125 checks、検索309 assertions、および admin PHP / JS、lifecycle、uninstall の独立 suite |
+| PHP 8.1 / 8.5 の独立回帰 suite | 成功 |
+| WordPress 6.6 / PHP 8.1 / MariaDB 11.7 | 初期化2回、保存実体、実 INSERT 障害・回復、正常 hybrid 書換え、検索障害時ページング、非破壊の設定変更が成功 |
+| WordPress 7.0.4 / PHP 8.1 / MariaDB 11.7 | 同じ統合試験が成功 |
+| WordPress 7.1 / PHP 8.3 / MariaDB 11.8 | 同じ統合試験に加え、meta のみの変更、term 改名、再公開、欠損行修復が成功 |
+| WordPress 7.1 multisite | network activation、新規サイトのテーブル準備、site switch / restore の設定分離が成功 |
+| WordPress 7.1 / MySQL 9.4 | native vector table を作らず、query embedding を呼ばず、元の標準検索を維持 |
+| 実 DB の並行接続 | 同じ advisory lock の二重取得を拒否し、所有接続が解放した後は別接続で取得可能 |
+| 配布 gate | PHP syntax、PHPCS、Composer validation / audit、i18n、release / package / review audit、実 ZIP の Plugin Check が成功 |
+
+統合試験では、スタブだけでは分からなかった MariaDB の quoted index option 表記と、WordPress 標準 query var / core filter の扱いを修正し、回帰試験にも追加した。SQL 障害は実 MariaDB の trigger `SIGNAL` で注入し、旧チャンク一式と成功メタを保持することまで確認した。
+
+`tests/integration/` と `scripts/test-apple-regression.sh` に再実行可能な synthetic fixture を保存した。テスト用の専用 container / DB だけを使用し、外部 embedding API・実投稿・秘密情報は使っていない。既存の手動環境は変更していない。
+
+### 残る検証範囲と運用上の注意
+
+- 長期負荷、実 API のモデル別品質、実 Redis / Memcached drop-in、実接続を強制切断する試験は未実施。接続断・再試行・並行制御・永続 cache の故障経路は独立 suite で検証しており、実サービスでの運用確認とは区別する。
+- 第7節の E5 / Nomic 固有 prefix と token 上限は、backend 側での付与・切捨て契約が未確定のため、一律には変更していない。既存プリセットの request 形式を保持し、品質改善・対応範囲拡大の別課題とする。これは R01〜R15 の修正から独立した検証項目。
+- 旧 content hash は新世代の保存済みと認定しない。導入時は endpoint を確認し、バックアップ後に初期化を明示的に実行する。費用・停止・ロールバックは第6節と README に従う。
+- 正常な hybrid 検索の候補上限と、障害時に標準検索の全ページを維持する契約は別。custom query hook 等で安全に同じ条件を表現できない検索は標準検索を使う。
+
+## 10. テスト runtime の統一（2026-09-19）
+
+第2節の Docker CLI 不在・Compose 検証未実施はレビュー当時の記録。現在のテスト・release gate は Apple Container の `container` CLI に統一し、旧 Docker スクリプトと Compose manifest は削除した。`container-compose 1.1.0` に存在しない `config/run/exec` へ置換するのではなく、native CLI と明示的な readiness check を使用する。
+
+`make apple-container-check` は runtime 未導入・停止中に失敗する。`compose-config` は後方互換の alias として同じチェックを実行し、Compose ファイルの検証済みとは表示しない。旧 `COMPOSE` / `COMPOSE_FILE` / `WPCLI_COMMAND` 環境変数は拒否し、Docker や任意の command string を誤実行しない。互換性 matrix は隔離した ZIP インストール・バージョン固定・後始末を維持する。
+
+移行後に `make test`、`apple-container-check`、WordPress 7.0.4 / MariaDB、WordPress 7.1 / MariaDB + Plugin Check、WordPress 7.1 / MySQL fallback を実行し、すべて成功した。vector probe の実行・専用テーブル削除も確認した。回帰試験では偽の Docker / Compose 実行ファイルを PATH に置き、旧設定を拒否する際にも runtime 不在・停止時にも一度も呼ばれないことを確認する。互換性テストの専用 container / network / volume は終了時に削除された。
+
+## 11. 同義語検索とテーマ／プラグイン互換性の追加修正（2026-09-19）
+
+`pre_get_posts` に外部 callback が存在するだけで標準検索へ戻す実装は過剰だった。Visualizer のようにメイン検索を変更しない callback でも、埋め込み API を呼ばず、本文と異なる表記の語が0件になることを再現した。
+
+RiTriever の実行を `pre_get_posts` の最終優先度へ移し、それより前に実行済みの callback の登録自体を拒否理由から外した。テーマが設定した投稿対象・除外・件数等を取り込んでから候補を生成・検証する。独自 SQL フィルター、未対応 query var、同じ最終優先度の外部 callback は引き続き標準検索へ退避する。cache 形式の版も更新した。
+
+独立回帰試験と実 WordPress / MariaDB の synthetic fixture で、「ミツバチ」を含み「蜜蜂」を含まない投稿に対して、前者の本文一致と後者の RAG のみのヒットを確認した。Visualizer 相当のフック、メイン検索限定の対象・除外変更、warm cache を含めた。これは検索経路の検証であり、実 provider のモデル品質を保証するものではない。
+
+検索モード `off`・provider 未設定・索引0件も同じ症状を生むため、コードのフック互換性と設定／索引の準備状態は分けて診断する。未設定サイトで自動的に provider を選ぶ、外部 API を呼ぶ、全投稿を再索引する処理は追加しない。

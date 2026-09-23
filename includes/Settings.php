@@ -79,19 +79,22 @@ final class Settings
     ];
 
     private static ?array $cache = null;
+    private static ?int $cache_blog_id = null;
 
     private function __construct() {}
 
     public static function all(): array
     {
-        if (self::$cache !== null) {
+        $blog_id = function_exists("get_current_blog_id") ? get_current_blog_id() : 1;
+        if (self::$cache !== null && self::$cache_blog_id === $blog_id) {
             return self::$cache;
         }
         $stored = get_option(RITRIEVER_OPTION_KEY, []);
         if (!is_array($stored)) {
             $stored = [];
         }
-        self::$cache = self::sanitize(array_replace(self::DEFAULTS, $stored));
+        self::$cache = self::sanitize($stored);
+        self::$cache_blog_id = $blog_id;
         return self::$cache;
     }
 
@@ -187,7 +190,14 @@ final class Settings
         } else {
             $presets = self::custom_embedding_presets();
             $preset_key = (string) $out["custom_embedding_preset"];
-            if ($out["embedding_provider"] !== "custom_http") {
+            if (
+                !array_key_exists("custom_embedding_preset", $raw) &&
+                $out["embedding_provider"] !== "custom_http" &&
+                (
+                    $out["embedding_provider"] !== $base["embedding_provider"] ||
+                    !array_key_exists("custom_embedding_preset", (array) $stored)
+                )
+            ) {
                 $preset_key = self::default_custom_preset_for_provider(
                     (string) $out["embedding_provider"],
                     $preset_key,
@@ -196,20 +206,30 @@ final class Settings
             }
             if ($preset_key !== "custom" && isset($presets[$preset_key])) {
                 $preset = $presets[$preset_key];
-                $out["custom_embedding_endpoint"] = $preset["endpoint"];
-                $out["custom_embedding_model"] = $preset["model"];
-                $out["custom_embedding_format"] = $preset["format"];
-                $out["embedding_dimensions"] = $preset["dimensions"];
-            } else {
-                $out["embedding_dimensions"] = max(
-                    1,
-                    min(4096, (int) $out["embedding_dimensions"]),
-                );
-                if (trim((string) $out["custom_embedding_model"]) === "") {
-                    $out["custom_embedding_model"] =
-                        "custom-http-" . (int) $out["embedding_dimensions"];
+                $explicit_selection =
+                    $preset_key !== $base["custom_embedding_preset"] ||
+                    (
+                        $out["embedding_provider"] !== $base["embedding_provider"] &&
+                        $preset["provider"] === $out["embedding_provider"]
+                    );
+                foreach ([
+                    "custom_embedding_endpoint" => "endpoint",
+                    "custom_embedding_model" => "model",
+                    "custom_embedding_format" => "format",
+                    "embedding_dimensions" => "dimensions",
+                ] as $field => $preset_field) {
+                    if (
+                        !array_key_exists($field, $raw) &&
+                        ($explicit_selection || !array_key_exists($field, (array) $stored))
+                    ) {
+                        $out[$field] = $preset[$preset_field];
+                    }
                 }
             }
+            $out["embedding_dimensions"] = max(
+                1,
+                min(4096, (int) $out["embedding_dimensions"]),
+            );
         }
         $out["target_locale"] = LanguageOptions::sanitize_locale(
             (string) $out["target_locale"],
@@ -388,6 +408,28 @@ final class Settings
 
     public static function _flush_cache_for_tests(): void
     {
+        self::clear_cache();
+    }
+
+    public static function clear_cache(): void
+    {
         self::$cache = null;
+        self::$cache_blog_id = null;
+    }
+
+    public static function reset_cache(): void
+    {
+        self::clear_cache();
+        if (function_exists("wp_cache_delete")) {
+            wp_cache_delete(RITRIEVER_OPTION_KEY, "options");
+            wp_cache_delete("alloptions", "options");
+            wp_cache_delete("notoptions", "options");
+        }
+    }
+
+    public static function refresh(): void
+    {
+        self::reset_cache();
+        self::all();
     }
 }

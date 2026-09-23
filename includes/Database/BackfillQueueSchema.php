@@ -1,6 +1,6 @@
 <?php
 /**
- * Dedicated tables for initial backfill jobs and queue items.
+ * Durable, revision-fenced queue schema.
  *
  * @package RiTriever
  */
@@ -9,13 +9,9 @@ declare(strict_types=1);
 
 namespace RiTriever\Database;
 
-// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching,WordPress.DB.DirectDatabaseQuery.SchemaChange -- Custom queue table schema lifecycle requires explicit DDL with internally controlled table names.
-
-use RiTriever\Logger;
-
 final class BackfillQueueSchema
 {
-    private function __construct() {}
+    private static array $installed = [];
 
     public static function jobs_table(): string
     {
@@ -31,89 +27,79 @@ final class BackfillQueueSchema
 
     public static function install_or_upgrade(): void
     {
+        if (isset(self::$installed[self::jobs_table()])) {
+            return;
+        }
+        DatabaseLock::with("queue-schema", static function (): void {
+            self::install_schema();
+        });
+    }
+
+    private static function install_schema(): void
+    {
         global $wpdb;
-
-        $charset = self::charset_collate_sql();
         $jobs = self::jobs_table();
-        $items = self::items_table();
-
-        $jobs_sql = $wpdb->prepare(
+        if (isset(self::$installed[$jobs])) {
+            return;
+        }
+        $charset = " " . (string) preg_replace("/[^a-zA-Z0-9_ =-]/", "", $wpdb->get_charset_collate());
+        Sql::query($wpdb->prepare(
             "CREATE TABLE IF NOT EXISTS %i (" .
-            " id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT," .
-            " status VARCHAR(20) NOT NULL DEFAULT 'queued'," .
-            " phase VARCHAR(40) NOT NULL DEFAULT 'queued'," .
-            " total_posts BIGINT UNSIGNED NOT NULL DEFAULT 0," .
-            " created_at DATETIME NOT NULL," .
-            " updated_at DATETIME NOT NULL," .
-            " completed_at DATETIME NULL DEFAULT NULL," .
-            " last_error TEXT NULL," .
-            " PRIMARY KEY (id)," .
-            " KEY status_updated (status, updated_at)" .
-            ")",
+            "id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT," .
+            "status VARCHAR(20) NOT NULL DEFAULT 'preparing'," .
+            "phase VARCHAR(40) NOT NULL DEFAULT 'preparing'," .
+            "kind VARCHAR(16) NOT NULL DEFAULT 'initial'," .
+            "index_generation VARCHAR(64) NOT NULL DEFAULT ''," .
+            "total_posts BIGINT UNSIGNED NOT NULL DEFAULT 0," .
+            "created_at DATETIME NOT NULL, updated_at DATETIME NOT NULL," .
+            "completed_at DATETIME NULL DEFAULT NULL, last_error TEXT NULL," .
+            "PRIMARY KEY (id), KEY status_updated (status, updated_at)" .
+            ") ENGINE=InnoDB",
             $jobs,
-        );
-        if ($charset !== "") {
-            $jobs_sql .= " " . $charset;
-        }
-
-        $items_sql = $wpdb->prepare(
+        ) . $charset);
+        Sql::query($wpdb->prepare(
             "CREATE TABLE IF NOT EXISTS %i (" .
-            " id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT," .
-            " job_id BIGINT UNSIGNED NOT NULL," .
-            " post_id BIGINT UNSIGNED NOT NULL," .
-            " status VARCHAR(20) NOT NULL DEFAULT 'pending'," .
-            " attempts INT UNSIGNED NOT NULL DEFAULT 0," .
-            " locked_at DATETIME NULL DEFAULT NULL," .
-            " locked_by VARCHAR(64) NOT NULL DEFAULT ''," .
-            " last_error TEXT NULL," .
-            " created_at DATETIME NOT NULL," .
-            " updated_at DATETIME NOT NULL," .
-            " PRIMARY KEY (id)," .
-            " UNIQUE KEY job_post (job_id, post_id)," .
-            " KEY job_status_id (job_id, status, id)," .
-            " KEY job_lock (job_id, locked_by)," .
-            " KEY stale_processing (status, locked_at)" .
-            ")",
-            $items,
-        );
-        if ($charset !== "") {
-            $items_sql .= " " . $charset;
+            "id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT," .
+            "job_id BIGINT UNSIGNED NOT NULL, post_id BIGINT UNSIGNED NOT NULL," .
+            "status VARCHAR(20) NOT NULL DEFAULT 'pending'," .
+            "attempts INT UNSIGNED NOT NULL DEFAULT 0," .
+            "revision BIGINT UNSIGNED NOT NULL DEFAULT 1," .
+            "claimed_revision BIGINT UNSIGNED NOT NULL DEFAULT 0," .
+            "available_at DATETIME NULL DEFAULT NULL," .
+            "locked_at DATETIME NULL DEFAULT NULL, locked_by VARCHAR(64) NOT NULL DEFAULT ''," .
+            "last_error TEXT NULL, created_at DATETIME NOT NULL, updated_at DATETIME NOT NULL," .
+            "PRIMARY KEY (id), UNIQUE KEY job_post (job_id, post_id)," .
+            "KEY job_status_id (job_id, status, id), KEY job_lock (job_id, locked_by)" .
+            ") ENGINE=InnoDB",
+            self::items_table(),
+        ) . $charset);
+        $job_columns = array_column(Sql::rows($wpdb->prepare("SHOW COLUMNS FROM %i", $jobs)), "Field");
+        if (!in_array("kind", $job_columns, true)) {
+            Sql::query($wpdb->prepare("ALTER TABLE %i ADD COLUMN kind VARCHAR(16) NOT NULL DEFAULT 'initial'", $jobs));
         }
-
-        // phpcs:ignore WordPress.DB.DirectDatabaseQuery.SchemaChange,WordPress.DB.PreparedSQL.NotPrepared,PluginCheck.Security.DirectDB.UnescapedDBParameter -- Fixed schema DDL.
-        if ($wpdb->query($jobs_sql) === false) {
-            Logger::error("queue_schema", "failed to create jobs table", [
-                "error" => $wpdb->last_error,
-            ]);
+        if (!in_array("index_generation", $job_columns, true)) {
+            Sql::query($wpdb->prepare("ALTER TABLE %i ADD COLUMN index_generation VARCHAR(64) NOT NULL DEFAULT ''", $jobs));
         }
-
-        // phpcs:ignore WordPress.DB.DirectDatabaseQuery.SchemaChange,WordPress.DB.PreparedSQL.NotPrepared,PluginCheck.Security.DirectDB.UnescapedDBParameter -- Fixed schema DDL.
-        if ($wpdb->query($items_sql) === false) {
-            Logger::error("queue_schema", "failed to create items table", [
-                "error" => $wpdb->last_error,
-            ]);
+        $item_columns = array_column(Sql::rows($wpdb->prepare("SHOW COLUMNS FROM %i", self::items_table())), "Field");
+        if (!in_array("revision", $item_columns, true)) {
+            Sql::query($wpdb->prepare("ALTER TABLE %i ADD COLUMN revision BIGINT UNSIGNED NOT NULL DEFAULT 1", self::items_table()));
         }
+        if (!in_array("claimed_revision", $item_columns, true)) {
+            Sql::query($wpdb->prepare("ALTER TABLE %i ADD COLUMN claimed_revision BIGINT UNSIGNED NOT NULL DEFAULT 0", self::items_table()));
+        }
+        if (!in_array("available_at", $item_columns, true)) {
+            Sql::query($wpdb->prepare("ALTER TABLE %i ADD COLUMN available_at DATETIME NULL DEFAULT NULL", self::items_table()));
+        }
+        // Never infer success for legacy jobs whose generation was not recorded.
+        Sql::query($wpdb->prepare("UPDATE %i SET status = 'cancelled', phase = 'migration', last_error = 'Legacy job requires explicit initialization.' WHERE index_generation = '' AND status IN ('queued','running','paused','preparing','complete')", $jobs));
+        self::$installed[$jobs] = true;
     }
 
     public static function drop(): void
     {
         global $wpdb;
-        $items = self::items_table();
-        $jobs = self::jobs_table();
-        // phpcs:ignore WordPress.DB.DirectDatabaseQuery.SchemaChange,WordPress.DB.PreparedSQL.NotPrepared -- Uninstall cleanup.
-        $wpdb->query($wpdb->prepare("DROP TABLE IF EXISTS %i", $items));
-        // phpcs:ignore WordPress.DB.DirectDatabaseQuery.SchemaChange,WordPress.DB.PreparedSQL.NotPrepared -- Uninstall cleanup.
-        $wpdb->query($wpdb->prepare("DROP TABLE IF EXISTS %i", $jobs));
-    }
-
-    private static function charset_collate_sql(): string
-    {
-        global $wpdb;
-        $charset = preg_replace(
-            "/[^a-zA-Z0-9_ =-]/",
-            "",
-            $wpdb->get_charset_collate(),
-        );
-        return is_string($charset) ? trim($charset) : "";
+        Sql::query($wpdb->prepare("DROP TABLE IF EXISTS %i", self::items_table()));
+        Sql::query($wpdb->prepare("DROP TABLE IF EXISTS %i", self::jobs_table()));
+        unset(self::$installed[self::jobs_table()]);
     }
 }

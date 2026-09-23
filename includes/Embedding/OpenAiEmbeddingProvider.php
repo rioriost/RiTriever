@@ -20,6 +20,12 @@ final class OpenAiEmbeddingProvider implements EmbeddingProviderInterface
 
     public function embed_many(array $texts): array
     {
+        if ((bool) Settings::get("kill_switch_global")) {
+            throw new EmbeddingProviderException("RiTriever is globally stopped. No embedding request was sent.");
+        }
+        if ($texts === []) {
+            return [];
+        }
         $key = (string) Settings::get("openai_api_key");
         if ($key === "") {
             throw new \RuntimeException("OpenAI API key is empty.");
@@ -39,42 +45,14 @@ final class OpenAiEmbeddingProvider implements EmbeddingProviderInterface
                 "Authorization" => "Bearer " . $key,
                 "Content-Type" => "application/json",
             ],
-            "body" => wp_json_encode($body),
+            "body" => EmbeddingResponseValidator::encode_request($body, $texts),
         ]);
-        if (is_wp_error($response)) {
-            // phpcs:ignore WordPress.Security.EscapeOutput.ExceptionNotEscaped -- Exception text is not output here; admin render escapes notices.
-            throw new \RuntimeException($response->get_error_message());
-        }
-        $body = (string) wp_remote_retrieve_body($response);
-        $payload = json_decode($body, true);
-        $code = (int) wp_remote_retrieve_response_code($response);
-        if ($code < 200 || $code >= 300) {
-            $message = is_array($payload["error"] ?? null)
-                ? (string) ($payload["error"]["message"] ?? "")
-                : "";
-            if ($message === "") {
-                $message = "Unexpected OpenAI API response.";
-            }
-            throw new \RuntimeException(
-                "OpenAI API error " .
-                    esc_html((string) $code) .
-                    ": " .
-                    esc_html($message),
-            );
-        }
-        $data = is_array($payload["data"] ?? null) ? $payload["data"] : [];
-        if ($data === []) {
-            throw new \RuntimeException(
-                "OpenAI embedding response returned no data.",
-            );
-        }
-        $out = [];
-        foreach ($data as $item) {
-            $out[] = array_map(
-                "floatval",
-                is_array($item["embedding"] ?? null) ? $item["embedding"] : [],
-            );
-        }
-        return $out;
+        return EmbeddingResponseValidator::from_payload(
+            EmbeddingResponseValidator::decode_response($response),
+            count($texts),
+            $dimensions,
+            (string) Settings::get("vector_distance"),
+            true,
+        );
     }
 }

@@ -1,6 +1,11 @@
 # Implementation Roadmap
 
-## Phase 0 — Scaffold (current)
+This is the original staged roadmap. Scaffold, background queue, admin diagnostics,
+and extraction controls below are now implemented. The current integrity work,
+completed acceptance evidence, and explicitly deferred quality experiments are
+tracked in [`docs/gpt-6-astra-review-plan-2026-09-18.md`](../docs/gpt-6-astra-review-plan-2026-09-18.md).
+
+## Phase 0 — Scaffold
 
 - Plugin bootstrap.
 - Settings schema.

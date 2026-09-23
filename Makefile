@@ -18,10 +18,12 @@ WP_BASELINE_VERSION ?= 7.0.4
 WP_STABLE_VERSION ?= 7.1
 WP_COMPAT_DB ?= mariadb
 
-.PHONY: help version install-tools static-check check composer-validate lint phpcs-security composer-audit compose-config plugin-check wordpress-compat wordpress-compat-baseline wordpress-compat-stable wordpress-compat-matrix wordpress-compat-mysql apple-container-up apple-container-down apple-container-reset i18n-pot i18n-pot-check release-audit review-audit package-audit wordpress-org-assets-audit wordpress-org-checkout wordpress-org-stage wordpress-org-release clean package release
+.PHONY: help version test install-tools static-check check composer-validate lint phpcs-security composer-audit apple-container-check compose-config plugin-check wordpress-compat wordpress-compat-baseline wordpress-compat-stable wordpress-compat-matrix wordpress-compat-mysql apple-container-up apple-container-down apple-container-reset i18n-pot i18n-pot-check release-audit review-audit package-audit wordpress-org-assets-audit wordpress-org-checkout wordpress-org-stage wordpress-org-release clean package release
 
 help:
 	@echo "Targets:"
+	@echo "  make test                     Run isolated PHP and JavaScript regression tests"
+	@echo "  make apple-container-check    Require the Apple Container runtime (no fallback)"
 	@echo "  make check                    Run WordPress.org release gate checks"
 	@echo "  make release                  Run release gates and build $(ZIP_FILE)"
 	@echo "  make wordpress-compat-baseline Test WordPress $(WP_BASELINE_VERSION) on MariaDB"
@@ -38,6 +40,9 @@ help:
 version:
 	@echo $(PLUGIN_VERSION)
 
+test:
+	sh scripts/run-regression-tests.sh
+
 install-tools:
 	composer install --no-interaction --no-progress
 
@@ -53,8 +58,12 @@ phpcs-security: install-tools
 composer-audit: install-tools
 	composer audit --no-interaction
 
-compose-config:
-	if command -v docker >/dev/null 2>&1; then docker compose config >/dev/null && docker compose --profile tools config >/dev/null; else echo "docker not found; skipping Compose config validation"; fi
+apple-container-check:
+	sh scripts/apple-container-runtime.sh --check
+	@for script in scripts/*.sh; do sh -n "$$script" || exit; done
+
+compose-config: apple-container-check
+	@echo "compose-config is deprecated; Apple Container runtime/scripts checked (no Compose manifests)."
 
 plugin-check:
 	RITRIEVER_WORDPRESS_VERSION="$(WP_STABLE_VERSION)" APPLE_CONTAINER_AUTO_START=$${APPLE_CONTAINER_AUTO_START:-1} PLUGIN_ZIP="$(ZIP_FILE)" sh scripts/run-plugin-check.sh
@@ -69,7 +78,9 @@ wordpress-compat-baseline:
 wordpress-compat-stable:
 	RITRIEVER_RUN_PLUGIN_CHECK=1 sh scripts/test-wordpress-compat.sh "$(WP_STABLE_VERSION)" mariadb
 
-wordpress-compat-matrix: wordpress-compat-baseline wordpress-compat-stable
+wordpress-compat-matrix:
+	$(MAKE) wordpress-compat-baseline
+	$(MAKE) wordpress-compat-stable
 
 wordpress-compat-mysql:
 	sh scripts/test-wordpress-compat.sh "$(WP_STABLE_VERSION)" mysql
@@ -93,9 +104,11 @@ i18n-pot-check:
 release-audit:
 	grep -q '^ \* Plugin Name:       RiTriever$$' $(PLUGIN_FILE)
 	grep -q '^ \* Text Domain:       $(PLUGIN_SLUG)$$' $(PLUGIN_FILE)
+	grep -q '^const RITRIEVER_VERSION = "$(PLUGIN_VERSION)";$$' $(PLUGIN_FILE)
 	test "$$(awk -F ': *' '/^ \* Tested up to:/ { print $$2; exit }' $(PLUGIN_FILE))" = "$$(awk -F ': *' '/^Tested up to:/ { print $$2; exit }' readme.txt)"
 	grep -q '^=== RiTriever ===$$' readme.txt
 	grep -q '^Stable tag: $(PLUGIN_VERSION)$$' readme.txt
+	grep -q '^= $(PLUGIN_VERSION) =$$' readme.txt
 	test -f $(POT_FILE)
 	test -f readme.txt
 	grep -q '^== External services ==$$' readme.txt
@@ -120,7 +133,7 @@ review-audit:
 	grep -RIn 'remember_cache_key' includes/SearchInterceptor.php >/dev/null
 	grep -RIn 'delete_option(self::CACHE_INDEX_OPTION)' includes/SearchInterceptor.php >/dev/null
 
-static-check: composer-validate lint phpcs-security composer-audit compose-config i18n-pot-check release-audit wordpress-org-assets-audit review-audit
+static-check: test composer-validate lint phpcs-security composer-audit apple-container-check i18n-pot-check release-audit wordpress-org-assets-audit review-audit
 
 check: static-check clean package package-audit plugin-check
 
@@ -147,6 +160,8 @@ package-audit:
 	test -f $(ZIP_FILE)
 	unzip -l $(ZIP_FILE) | grep -q '$(PLUGIN_SLUG)/readme.txt'
 	unzip -l $(ZIP_FILE) | grep -q '$(PLUGIN_SLUG)/$(POT_FILE)'
+	test "$$(unzip -p $(ZIP_FILE) $(PLUGIN_SLUG)/$(PLUGIN_FILE) | awk -F ': *' '/^ \* Version:/ { print $$2; exit }')" = "$(PLUGIN_VERSION)"
+	test "$$(unzip -p $(ZIP_FILE) $(PLUGIN_SLUG)/readme.txt | awk -F ': *' '/^Stable tag:/ { print $$2; exit }')" = "$(PLUGIN_VERSION)"
 	test "$$(unzip -p $(ZIP_FILE) $(PLUGIN_SLUG)/$(PLUGIN_FILE) | awk -F ': *' '/^ \* Tested up to:/ { print $$2; exit }')" = "$(WP_TESTED_VERSION)"
 	test "$$(unzip -p $(ZIP_FILE) $(PLUGIN_SLUG)/readme.txt | awk -F ': *' '/^Tested up to:/ { print $$2; exit }')" = "$(WP_TESTED_VERSION)"
 	! unzip -l $(ZIP_FILE) | grep -E 'ai-retriever|wp-retriever|wp_retriever' >/dev/null

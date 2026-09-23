@@ -20,10 +20,10 @@ msgstr ""
 msgid "API key is configured"
 msgstr ""
 
-msgid "Automatic indexing is running..."
+msgid "Attempts: %1$d; next scheduled run: %2$s; stop reason: %3$s."
 msgstr ""
 
-msgid "Automatic indexing is running. You can leave this page open; if you close it, indexing will resume when you return and may also continue through WP-Cron where available."
+msgid "Automatic indexing is running..."
 msgstr ""
 
 msgid "Best chunk snippet"
@@ -128,10 +128,31 @@ msgstr ""
 msgid "Full"
 msgstr ""
 
+msgid "Global stop"
+msgstr ""
+
 msgid "Index diagnostics"
 msgstr ""
 
 msgid "Indexed posts"
+msgstr ""
+
+msgid "Indexing is not currently running."
+msgstr ""
+
+msgid "Indexing is paused."
+msgstr ""
+
+msgid "Indexing progress: %1$d / %2$d posts processed, %3$d terminal errors."
+msgstr ""
+
+msgid "Indexing stopped with errors. Check the plugin log and retry failed posts."
+msgstr ""
+
+msgid "Indexing was cancelled."
+msgstr ""
+
+msgid "Index readiness"
 msgstr ""
 
 msgid "Initialization"
@@ -143,34 +164,16 @@ msgstr ""
 msgid "Initialization failed. Check the plugin log."
 msgstr ""
 
-msgid "Initialization is complete. RAG search is ready."
-msgstr ""
-
-msgid "Initialization is not currently running."
-msgstr ""
-
-msgid "Initialization is paused."
-msgstr ""
-
 msgid "Initialization is unavailable because native vector support is not enabled for this database."
 msgstr ""
 
 msgid "Initialization processed %1$d posts but found %2$d errors. Check post meta/logs and run again."
 msgstr ""
 
-msgid "Initialization progress: %1$d / %2$d posts processed, %3$d errors."
-msgstr ""
-
 msgid "Initialization queued %d posts. Indexing will start automatically while this page is open."
 msgstr ""
 
 msgid "Initialization stopped after %1$d / %2$d posts with %3$d errors."
-msgstr ""
-
-msgid "Initialization stopped with errors. Check the plugin log and retry failed posts."
-msgstr ""
-
-msgid "Initialization was cancelled."
 msgstr ""
 
 msgid "Initialize"
@@ -218,6 +221,9 @@ msgstr ""
 msgid "No failed indexing records found."
 msgstr ""
 
+msgid "Not ready — standard search remains active"
+msgstr ""
+
 msgid "No vector hits returned."
 msgstr ""
 
@@ -239,7 +245,10 @@ msgstr ""
 msgid "Pause"
 msgstr ""
 
-msgid "Presets fill endpoint, model, and dimensions. Hosted fallback providers are limited to Azure OpenAI; these custom presets are for local or self-hosted services."
+msgid "Pending snapshot items: %1$d; current failed posts: %2$d."
+msgstr ""
+
+msgid "Presets now fill fields only when selected. If an earlier version overwrote your endpoint, deployment or model, re-enter those values and test the connection before rebuilding."
 msgstr ""
 
 msgid "Processed initialization batch. Progress: %1$d / %2$d."
@@ -249,6 +258,9 @@ msgid "Provider/model preset"
 msgstr ""
 
 msgid "Provider: %1$s, model: %2$s, elapsed: %3$d ms."
+msgstr ""
+
+msgid "Queued work runs in bounded batches. WP-Cron needs site traffic or an external scheduler; paused or globally stopped work does not resume automatically."
 msgstr ""
 
 msgid "Queue status"
@@ -264,6 +276,9 @@ msgid "RAG search settings"
 msgstr ""
 
 msgid "RAG target language"
+msgstr ""
+
+msgid "Ready"
 msgstr ""
 
 msgid "Request format"
@@ -284,7 +299,16 @@ msgstr ""
 msgid "Retry finished with remaining errors. Processed: %1$d, remaining errors: %2$d."
 msgstr ""
 
+msgid "Retry snapshot: %1$d posts; queued: %2$d; skipped: %3$d. No work was queued. Check eligible posts, synchronization settings and index readiness."
+msgstr ""
+
+msgid "Retry snapshot: %1$d posts; queued: %2$d; skipped: %3$d. Progress below tracks the current retry snapshot. Retries run in bounded batches, without a total retry cap."
+msgstr ""
+
 msgid "RiTriever"
+msgstr ""
+
+msgid "RiTriever is globally stopped. WordPress standard search remains available. Disable Global stop before running embedding, initialization or retry operations; resume paused queues explicitly."
 msgstr ""
 
 msgid "RiTriever requires PHP 8.1 or higher."
@@ -305,6 +329,9 @@ msgstr ""
 msgid "Score"
 msgstr ""
 
+msgid "Selecting a preset fills endpoint, model, format and dimensions once. You can then customize these fields; saving or reopening this page will not reset them."
+msgstr ""
+
 msgid "Site language (%s)"
 msgstr ""
 
@@ -312,6 +339,9 @@ msgid "Standard search"
 msgstr ""
 
 msgid "Status"
+msgstr ""
+
+msgid "Stop vector search, synchronization, queue work and embedding requests."
 msgstr ""
 
 msgid "Taxonomies to index"
@@ -332,10 +362,16 @@ msgstr ""
 msgid "The first initialization can take a long time, especially with many posts or a remote embedding API."
 msgstr ""
 
+msgid "The indexing queue is complete. Search availability also depends on index readiness and your search settings."
+msgstr ""
+
 msgid "This sends a short test string to the configured external embedding provider and may incur a small API charge."
 msgstr ""
 
 msgid "Title"
+msgstr ""
+
+msgid "Unknown"
 msgstr ""
 
 msgid "Upper limit of vector candidates before blending with core WordPress search. Smaller values narrow the retrieval range. Allowed range: 1-200."

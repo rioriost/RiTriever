@@ -4,7 +4,7 @@ Tags: search, semantic search, vector search, embeddings, rag
 Requires at least: 6.6
 Tested up to: 7.1
 Requires PHP: 8.1
-Stable tag: 0.2.4
+Stable tag: 0.2.5
 License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -69,13 +69,35 @@ Yes. MariaDB 11.7 or later is the primary supported target for native vector col
 
 = What happens when I change the target language or embedding model? =
 
-The vector table must be rebuilt. Run initialization again after changing target language, provider, model, dimensions, or vector distance settings.
+The index becomes unavailable to hybrid search until initialization completes. Saving settings does not drop the existing vector table or automatically send every post to the provider. Back up the database and explicitly run initialization after changing target language, provider, model, dimensions, chunking, indexing scope, or vector index settings. Initialization rebuilds vectors and may incur embedding API charges.
+
+= How are post updates indexed? =
+
+After initialization, post, selected metadata, and taxonomy changes enter a background queue. Search reflects those changes when the queue processes them. WP-Cron needs site traffic or an external scheduler; keeping the settings page open is not a substitute for scheduled processing.
+
+= What happens when retrieval fails? =
+
+The original WordPress search remains available, including its native pagination. Failed retrievals are not cached as successful hybrid results. Healthy hybrid search uses a bounded candidate set and does not promise every native search match.
+
+= Does upgrading to 0.2.5 require initialization? =
+
+When upgrading from the published 0.2.4 or earlier, yes. Existing content hashes are not proof of storage in the new index generation. Back up the database, verify customized endpoints, and explicitly initialize once; external embedding providers may charge for reindexing. A previously overwritten endpoint must be re-entered. All WordPress source tables used for indexing must use InnoDB.
+
+If you already installed a generation-aware development build and its index is ready, the version change and front-end hook fix alone do not require another reindex. Replace the existing plugin rather than uninstalling it, since uninstall removes plugin settings and index data.
 
 == Screenshots ==
 
 No screenshots are included in this release.
 
 == Changelog ==
+
+= 0.2.5 =
+* Restore front-end semantic search with Visualizer and other earlier pre_get_posts callbacks while preserving effective query constraints.
+* Add index generations, durable storage receipts, atomic vector and metadata writes, and protection against stale concurrent workers.
+* Fix Unicode chunk boundaries, reinitialization and republication skips, queue recovery, retry progress, and metadata/taxonomy synchronization.
+* Preserve customized embedding endpoints and locales; validate HTTP responses, vector ordering, dimensions, and numeric values.
+* Preserve native search and pagination on retrieval failure; fix cache invalidation, title decoration, multisite isolation, and uninstall cleanup.
+* Add regression coverage and Apple Container compatibility/release gates.
 
 = 0.2.4 =
 * Confirm compatibility with the stable WordPress 7.1 release and run Plugin Check on WordPress 7.1.
@@ -96,6 +118,9 @@ No screenshots are included in this release.
 * Add WordPress.org release gates for PHPCS, Plugin Check, readme, i18n, and package contents.
 
 == Upgrade Notice ==
+
+= 0.2.5 =
+Back up before upgrading. Published 0.2.4 or earlier requires explicit index initialization and may incur API charges. A ready index from a generation-aware development build can be kept. Replace the plugin; do not uninstall. Fixes Visualizer-related front-end RAG suppression.
 
 = 0.2.4 =
 WordPress 7.1 compatibility release. No reindexing is required.

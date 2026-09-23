@@ -25,6 +25,7 @@
       Array.prototype.forEach.call(customPreset.options, function (option) {
         var optionProvider = option.getAttribute("data-provider") || "custom_http";
         var visible =
+          option.value === "custom" ||
           provider.value === "custom_http" || optionProvider === provider.value;
         option.hidden = !visible;
         option.disabled = !visible;
@@ -79,7 +80,24 @@
   }
 
   if (provider) {
-    provider.addEventListener("change", syncProviderRows);
+    provider.addEventListener("change", function () {
+      syncProviderRows();
+      if (provider.value === "openai" || !customPreset) {
+        return;
+      }
+      if (provider.value === "custom_http") {
+        customPreset.value = "custom";
+        return;
+      }
+      var options = customPreset.options;
+      for (var i = 0; i < options.length; i += 1) {
+        if (options[i].getAttribute("data-provider") === provider.value) {
+          customPreset.value = options[i].value;
+          break;
+        }
+      }
+      syncCustomPresetFields();
+    });
   }
   if (openAiModel) {
     openAiModel.addEventListener("change", syncProviderRows);
@@ -91,6 +109,5 @@
     customPreset.addEventListener("change", syncCustomPresetFields);
   }
   syncProviderRows();
-  syncCustomPresetFields();
   syncNormalizationRows();
 })();

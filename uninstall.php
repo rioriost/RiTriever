@@ -22,27 +22,43 @@ function ritriever_uninstall_site(): void
 
     ritriever_unschedule_site_cron();
 
-    delete_option("ritriever_settings");
-    delete_option("ritriever_backfill_queue");
-    delete_option("ritriever_query_cache_keys");
-    delete_option("ritriever_log");
+    ritriever_delete_registered_transients("ritriever_query_cache_keys", "ritriever_q_");
+    ritriever_delete_registered_transients("ritriever_query_cache_keys", "ritriever_live_query_");
+    ritriever_delete_registered_transients("ritriever_live_query_keys", "ritriever_live_query_");
+    ritriever_delete_registered_transients("ritriever_live_query_transient_keys", "ritriever_live_query_");
 
     ritriever_delete_transients("ritriever_q_");
     ritriever_delete_transients("ritriever_live_query_");
+
+    foreach ([
+        "ritriever_settings",
+        "ritriever_backfill_queue",
+        "ritriever_query_cache_keys",
+        "ritriever_live_query_keys",
+        "ritriever_live_query_transient_keys",
+        "ritriever_query_cache_generation",
+        "ritriever_index_state",
+        "ritriever_setup_error",
+        "ritriever_log",
+    ] as $option) {
+        delete_option($option);
+    }
 
     $postmeta_keys = [
         "_ritriever_content_hash",
         "_ritriever_indexed_at",
         "_ritriever_last_error",
+        "_ritriever_index_generation",
     ];
     // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery
     $wpdb->query(
         $wpdb->prepare(
-            "DELETE FROM %i WHERE meta_key IN (%s, %s, %s)",
+            "DELETE FROM %i WHERE meta_key IN (%s, %s, %s, %s)",
             $wpdb->postmeta,
             $postmeta_keys[0],
             $postmeta_keys[1],
             $postmeta_keys[2],
+            $postmeta_keys[3],
         ),
     );
 
@@ -52,10 +68,24 @@ function ritriever_uninstall_site(): void
 
     $queue_items_table = $wpdb->prefix . "ritriever_backfill_items";
     $queue_jobs_table = $wpdb->prefix . "ritriever_backfill_jobs";
+    $receipts_table = $wpdb->prefix . "ritriever_indexed_posts";
     // phpcs:ignore WordPress.DB.DirectDatabaseQuery.SchemaChange
     $wpdb->query($wpdb->prepare("DROP TABLE IF EXISTS %i", $queue_items_table));
     // phpcs:ignore WordPress.DB.DirectDatabaseQuery.SchemaChange
     $wpdb->query($wpdb->prepare("DROP TABLE IF EXISTS %i", $queue_jobs_table));
+    // phpcs:ignore WordPress.DB.DirectDatabaseQuery.SchemaChange
+    $wpdb->query($wpdb->prepare("DROP TABLE IF EXISTS %i", $receipts_table));
+}
+
+function ritriever_delete_registered_transients(string $option, string $prefix): void
+{
+    $registered = get_option($option, []);
+    foreach (is_array($registered) ? $registered : [] as $key => $value) {
+        $name = is_string($key) ? $key : $value;
+        if (is_string($name) && str_starts_with($name, $prefix)) {
+            delete_transient($name);
+        }
+    }
 }
 
 /**
@@ -99,24 +129,25 @@ function ritriever_delete_transients(string $prefix): void
  */
 function ritriever_unschedule_site_cron(): void
 {
-    $hook = "ritriever_process_backfill_queue";
-    $timestamp = wp_next_scheduled($hook);
-    while ($timestamp) {
-        wp_unschedule_event($timestamp, $hook);
-        $timestamp = wp_next_scheduled($hook);
+    foreach (["ritriever_process_backfill_queue", "ritriever_sync_post", "ritriever_resync_term"] as $hook) {
+        wp_unschedule_hook($hook);
     }
 }
 
 if (is_multisite()) {
-    $site_ids = get_sites([
-        "fields" => "ids",
-        "number" => 0,
-    ]);
-    foreach ($site_ids as $site_id) {
-        switch_to_blog((int) $site_id);
-        ritriever_uninstall_site();
-        restore_current_blog();
-    }
+    $offset = 0;
+    do {
+        $site_ids = get_sites(["fields" => "ids", "number" => 100, "offset" => $offset]);
+        foreach ($site_ids as $site_id) {
+            switch_to_blog((int) $site_id);
+            try {
+                ritriever_uninstall_site();
+            } finally {
+                restore_current_blog();
+            }
+        }
+        $offset += count($site_ids);
+    } while (count($site_ids) === 100);
 } else {
     ritriever_uninstall_site();
 }

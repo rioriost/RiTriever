@@ -1,5 +1,6 @@
 #!/bin/sh
 set -eu
+. "$(dirname "$0")/apple-container-runtime.sh"
 
 PLUGIN_SLUG="${PLUGIN_SLUG:-ritriever}"
 WP_PATH="${WP_PATH:-/var/www/html}"
@@ -26,21 +27,13 @@ if [ "$PLUGIN_ZIP" != "" ] && [ "${PLUGIN_ZIP#/}" = "$PLUGIN_ZIP" ]; then
 fi
 
 if [ "$APPLE_CONTAINER_AUTO_START" = "1" ] &&
-  [ "${WPCLI_COMMAND:-}" = "" ] &&
   [ "${WP_CONTAINER:-}" = "" ] &&
-  [ "${COMPOSE:-}" = "" ] &&
   ! command -v wp >/dev/null 2>&1; then
   sh scripts/apple-container-wordpress.sh up >/dev/null
   APPLE_CONTAINER_RUNNER=1
 fi
 
 run_wp() {
-  if [ "${WPCLI_COMMAND:-}" != "" ]; then
-    # shellcheck disable=SC2086
-    $WPCLI_COMMAND "$@"
-    return
-  fi
-
   if [ "${WP_CONTAINER:-}" != "" ]; then
     if [ "${WP_ALLOW_ROOT:-1}" = "1" ]; then
       container exec "$WP_CONTAINER" wp --allow-root --path="$WP_PATH" "$@"
@@ -60,20 +53,13 @@ run_wp() {
     return
   fi
 
-  if [ "${COMPOSE:-}" != "" ]; then
-    if [ "${WP_ALLOW_ROOT:-0}" = "1" ]; then
-      # shellcheck disable=SC2086
-      $COMPOSE run --rm ${WPCLI_RUN_OPTIONS:-} "${WPCLI_SERVICE:-wpcli-mariadb}" --allow-root --path="$WP_PATH" "$@"
-    else
-      # shellcheck disable=SC2086
-      $COMPOSE run --rm ${WPCLI_RUN_OPTIONS:-} "${WPCLI_SERVICE:-wpcli-mariadb}" --path="$WP_PATH" "$@"
-    fi
-    return
-  fi
-
-  echo "No WP-CLI runner found. Set WP_CONTAINER, WPCLI_COMMAND, COMPOSE, or install wp." >&2
+  echo "No WP-CLI runner found. Set WP_CONTAINER for Apple Container, enable APPLE_CONTAINER_AUTO_START, or install local wp." >&2
   exit 1
 }
+
+if [ -n "${WP_CONTAINER:-}" ] || [ "$APPLE_CONTAINER_RUNNER" = "1" ]; then
+  need_container
+fi
 
 if [ "$PLUGIN_ZIP" != "" ] && [ -f "$PLUGIN_ZIP" ]; then
   if [ "${WP_CONTAINER:-}" != "" ]; then
